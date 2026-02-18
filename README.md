@@ -4,15 +4,17 @@ Rendered markdown and LaTeX preview for [pi](https://github.com/badlogic/pi-mono
 
 ## Screenshots
 
-**Terminal preview (dark theme):**
+Preview adapts to your pi theme. Examples in dark and light:
+
+**Terminal preview (dark):**
 
 ![Dark terminal preview](screenshots/dark-terminal.png)
 
-**Terminal preview (light theme):**
+**Terminal preview (light):**
 
 ![Light terminal preview](screenshots/light-terminal.png)
 
-**Browser preview (adapts to your theme):**
+**Browser preview:**
 
 <p float="left">
   <img src="screenshots/dark-browser.png" width="49%" />
