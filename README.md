@@ -38,6 +38,12 @@ Rendered markdown and LaTeX preview for [pi](https://github.com/badlogic/pi-mono
 ## Install
 
 ```bash
+pi install npm:pi-markdown-preview
+```
+
+Or from GitHub:
+
+```bash
 pi install https://github.com/omaclaren/pi-markdown-preview
 ```
 
