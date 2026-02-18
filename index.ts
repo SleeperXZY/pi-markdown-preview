@@ -486,7 +486,7 @@ async function renderPageToPng(page: puppeteer.Page, markdownPage: string, style
 	};
 }
 
-async function renderPreview(markdown: string, style: PreviewStyle, signal?: AbortSignal, resourcePath?: string): Promise<RenderPreviewResult> {
+async function renderPreview(markdown: string, style: PreviewStyle, signal?: AbortSignal, resourcePath?: string, skipCache?: boolean): Promise<RenderPreviewResult> {
 	const split = splitMarkdownIntoPages(markdown);
 	const pages = split.pages;
 	const rendered: PreviewPage[] = new Array(pages.length);
@@ -503,7 +503,7 @@ async function renderPreview(markdown: string, style: PreviewStyle, signal?: Abo
 			}
 
 			const markdownPage = pages[i]!;
-			let pageResult = await readCachedPage(markdownPage, style.cacheKey);
+			let pageResult = skipCache ? undefined : await readCachedPage(markdownPage, style.cacheKey);
 
 			if (!pageResult) {
 				if (!browser) {
@@ -878,7 +878,7 @@ async function openPreview(ctx: ExtensionCommandContext, markdownOverride?: stri
 			done,
 			async () => {
 				const style = getPreviewStyle(ctx.ui.theme);
-				const refreshed = await renderPreview(markdown, style, undefined, resourcePath);
+				const refreshed = await renderPreview(markdown, style, undefined, resourcePath, true);
 				return refreshed;
 			},
 			async () => {
