@@ -25,7 +25,6 @@ Rendered markdown and LaTeX preview for [pi](https://github.com/badlogic/pi-mono
 - **Browser preview** — opens rendered HTML in your default browser as a single continuous scrollable document
 - **LaTeX/math support** — renders `$inline$` and `$$display$$` math via MathML
 - **Theme-aware** — matches your pi theme (dark/light, accent colours)
-- **Multi-page** — long responses are split into navigable pages
 - **Response picker** — select any past assistant response to preview, not just the latest
 - **File preview** — preview arbitrary `.md` files from the filesystem
 - **Caching** — rendered pages are cached for instant re-display; refresh (`r`) bypasses cache
