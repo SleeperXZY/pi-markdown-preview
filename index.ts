@@ -18,7 +18,7 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve as resolvePath } from "node:path";
+import { dirname, join, resolve as resolvePath } from "node:path";
 import { pathToFileURL } from "node:url";
 import puppeteer from "puppeteer-core";
 
@@ -426,10 +426,10 @@ async function waitForPageRenderReady(page: puppeteer.Page): Promise<void> {
 	});
 }
 
-async function renderPageToPng(page: puppeteer.Page, markdownPage: string, style: PreviewStyle): Promise<CachedPage> {
+async function renderPageToPng(page: puppeteer.Page, markdownPage: string, style: PreviewStyle, resourcePath?: string): Promise<CachedPage> {
 	const normalizedMarkdown = normalizeMathDelimiters(markdownPage);
-	const fragmentHtml = await renderMarkdownToHtmlWithPandoc(normalizedMarkdown);
-	const html = buildBrowserHtmlFromPandocFragment(fragmentHtml, style);
+	const fragmentHtml = await renderMarkdownToHtmlWithPandoc(normalizedMarkdown, resourcePath);
+	const html = buildBrowserHtmlFromPandocFragment(fragmentHtml, style, resourcePath);
 
 	await page.setViewport({
 		width: VIEWPORT_WIDTH_PX,
@@ -469,7 +469,7 @@ async function renderPageToPng(page: puppeteer.Page, markdownPage: string, style
 	};
 }
 
-async function renderPreview(markdown: string, style: PreviewStyle, signal?: AbortSignal): Promise<RenderPreviewResult> {
+async function renderPreview(markdown: string, style: PreviewStyle, signal?: AbortSignal, resourcePath?: string): Promise<RenderPreviewResult> {
 	const split = splitMarkdownIntoPages(markdown);
 	const pages = split.pages;
 	const rendered: PreviewPage[] = new Array(pages.length);
@@ -510,7 +510,7 @@ async function renderPreview(markdown: string, style: PreviewStyle, signal?: Abo
 					browserPage = await browser.newPage();
 				}
 
-				pageResult = await renderPageToPng(browserPage!, markdownPage, style);
+				pageResult = await renderPageToPng(browserPage!, markdownPage, style, resourcePath);
 				await writeCachedPage(markdownPage, style.cacheKey, pageResult).catch(() => {
 					// Cache write failures should not break rendering.
 				});
@@ -708,7 +708,7 @@ class MarkdownPreviewOverlay {
 	}
 }
 
-async function renderWithLoader(ctx: ExtensionCommandContext, markdown: string): Promise<RenderWithLoaderResult | null> {
+async function renderWithLoader(ctx: ExtensionCommandContext, markdown: string, resourcePath?: string): Promise<RenderWithLoaderResult | null> {
 	type LoaderResult = { ok: true; preview: RenderPreviewResult } | { ok: false; error: string } | { ok: false; cancelled: true };
 
 	const result = await ctx.ui.custom<LoaderResult>((tui, theme, _kb, done) => {
@@ -725,7 +725,7 @@ async function renderWithLoader(ctx: ExtensionCommandContext, markdown: string):
 		void (async () => {
 			try {
 				const style = getPreviewStyle(ctx.ui.theme);
-				const preview = await renderPreview(markdown, style, loader.signal);
+				const preview = await renderPreview(markdown, style, loader.signal, resourcePath);
 				if (loader.signal.aborted) {
 					resolve({ ok: false, cancelled: true });
 					return;
@@ -743,7 +743,7 @@ async function renderWithLoader(ctx: ExtensionCommandContext, markdown: string):
 	if (!result) {
 		try {
 			const style = getPreviewStyle(ctx.ui.theme);
-			const preview = await renderPreview(markdown, style);
+			const preview = await renderPreview(markdown, style, undefined, resourcePath);
 			return { preview, supportsCustomUi: false };
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -829,14 +829,14 @@ async function pickAssistantMessage(ctx: ExtensionCommandContext): Promise<strin
 	return selected ? selected.markdown : null;
 }
 
-async function openPreview(ctx: ExtensionCommandContext, markdownOverride?: string): Promise<void> {
+async function openPreview(ctx: ExtensionCommandContext, markdownOverride?: string, resourcePath?: string): Promise<void> {
 	const markdown = markdownOverride ?? getLastAssistantMarkdown(ctx);
 	if (!markdown) {
 		ctx.ui.notify("No assistant markdown found in the current branch.", "warning");
 		return;
 	}
 
-	const rendered = await renderWithLoader(ctx, markdown);
+	const rendered = await renderWithLoader(ctx, markdown, resourcePath);
 	if (!rendered) return;
 
 	const { preview: initialPreview, supportsCustomUi } = rendered;
@@ -861,11 +861,11 @@ async function openPreview(ctx: ExtensionCommandContext, markdownOverride?: stri
 			done,
 			async () => {
 				const style = getPreviewStyle(ctx.ui.theme);
-				const refreshed = await renderPreview(markdown, style);
+				const refreshed = await renderPreview(markdown, style, undefined, resourcePath);
 				return refreshed;
 			},
 			async () => {
-				await openPreviewInBrowser(ctx, markdown);
+				await openPreviewInBrowser(ctx, markdown, resourcePath);
 			},
 		),
 	);
@@ -893,9 +893,10 @@ async function openFileInDefaultBrowser(filePath: string): Promise<void> {
 	});
 }
 
-async function renderMarkdownToHtmlWithPandoc(markdown: string): Promise<string> {
+async function renderMarkdownToHtmlWithPandoc(markdown: string, resourcePath?: string): Promise<string> {
 	const pandocCommand = process.env.PANDOC_PATH?.trim() || "pandoc";
 	const args = ["-f", "gfm+tex_math_dollars", "-t", "html5", "--mathml", "--no-highlight"];
+	if (resourcePath) args.push(`--resource-path=${resourcePath}`);
 
 	return await new Promise<string>((resolve, reject) => {
 		const child = spawn(pandocCommand, args, { stdio: ["pipe", "pipe", "pipe"] });
@@ -948,12 +949,13 @@ async function renderMarkdownToHtmlWithPandoc(markdown: string): Promise<string>
 	});
 }
 
-function buildBrowserHtmlFromPandocFragment(fragmentHtml: string, style: PreviewStyle): string {
+function buildBrowserHtmlFromPandocFragment(fragmentHtml: string, style: PreviewStyle, resourcePath?: string): string {
 	const palette = style.palette;
+	const baseTag = resourcePath ? `\n<base href="${pathToFileURL(resourcePath + "/").href}" />` : "";
 	return `<!doctype html>
 <html>
 <head>
-<meta charset="utf-8" />
+<meta charset="utf-8" />${baseTag}
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>Markdown Preview</title>
 <style>
@@ -1055,7 +1057,7 @@ body {
 </html>`;
 }
 
-async function openPreviewInBrowser(ctx: ExtensionCommandContext, markdownOverride?: string): Promise<void> {
+async function openPreviewInBrowser(ctx: ExtensionCommandContext, markdownOverride?: string, resourcePath?: string): Promise<void> {
 	const markdown = markdownOverride ?? getLastAssistantMarkdown(ctx);
 	if (!markdown) {
 		throw new Error("No assistant markdown found in the current branch.");
@@ -1063,8 +1065,8 @@ async function openPreviewInBrowser(ctx: ExtensionCommandContext, markdownOverri
 
 	const style = getPreviewStyle(ctx.ui.theme);
 	const normalizedMarkdown = normalizeMathDelimiters(markdown);
-	const fragmentHtml = await renderMarkdownToHtmlWithPandoc(normalizedMarkdown);
-	const html = buildBrowserHtmlFromPandocFragment(fragmentHtml, style);
+	const fragmentHtml = await renderMarkdownToHtmlWithPandoc(normalizedMarkdown, resourcePath);
+	const html = buildBrowserHtmlFromPandocFragment(fragmentHtml, style, resourcePath);
 	const hash = createHash("sha256")
 		.update(RENDER_VERSION)
 		.update("\u0000")
@@ -1170,10 +1172,12 @@ export default function (pi: ExtensionAPI) {
 		await ctx.waitForIdle();
 
 		let markdown: string | undefined;
+		let resourcePath: string | undefined;
 		if (parsed.file) {
 			try {
 				const filePath = resolvePath(parsed.file);
 				markdown = await readFile(filePath, "utf-8");
+				resourcePath = dirname(filePath);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				ctx.ui.notify(`Failed to read file: ${message}`, "error");
@@ -1187,7 +1191,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (parsed.target === "browser") {
 			try {
-				await openPreviewInBrowser(ctx, markdown);
+				await openPreviewInBrowser(ctx, markdown, resourcePath);
 				ctx.ui.notify("Opened preview in browser.", "info");
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
@@ -1195,7 +1199,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			return;
 		}
-		await openPreview(ctx, markdown);
+		await openPreview(ctx, markdown, resourcePath);
 	};
 
 	const runBrowser = async (_args: string, ctx: ExtensionCommandContext) => {
