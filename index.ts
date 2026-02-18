@@ -16,7 +16,7 @@ import {
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -431,14 +431,30 @@ async function renderPageToPng(page: puppeteer.Page, markdownPage: string, style
 	const fragmentHtml = await renderMarkdownToHtmlWithPandoc(normalizedMarkdown, resourcePath);
 	const html = buildBrowserHtmlFromPandocFragment(fragmentHtml, style, resourcePath);
 
+	// When resourcePath is set, write HTML to a temp file so Chromium can
+	// resolve file:// image URLs. setContent() uses about:blank which blocks
+	// file:// access.
+	let tempHtmlPath: string | undefined;
+	const loadHtml = async () => {
+		if (resourcePath) {
+			if (!tempHtmlPath) {
+				tempHtmlPath = join(CACHE_DIR, `_render_tmp_${Date.now()}.html`);
+				await writeFile(tempHtmlPath, html, "utf-8");
+			}
+			await page.goto(pathToFileURL(tempHtmlPath).href, { waitUntil: "domcontentloaded" });
+		} else {
+			await page.setContent(html, { waitUntil: "domcontentloaded" });
+		}
+		await waitForPageRenderReady(page);
+	};
+
 	await page.setViewport({
 		width: VIEWPORT_WIDTH_PX,
 		height: 900,
 		deviceScaleFactor: 2,
 	});
 
-	await page.setContent(html, { waitUntil: "domcontentloaded" });
-	await waitForPageRenderReady(page);
+	await loadHtml();
 
 	const contentHeight = await page.evaluate(() => {
 		const root = document.getElementById("preview-root");
@@ -455,13 +471,14 @@ async function renderPageToPng(page: puppeteer.Page, markdownPage: string, style
 			height: captureHeight,
 			deviceScaleFactor: 2,
 		});
-		await page.setContent(html, { waitUntil: "domcontentloaded" });
-		await waitForPageRenderReady(page);
+		await loadHtml();
 	}
 
 	const screenshot = (await page.screenshot({
 		type: "png",
 	})) as Buffer;
+
+	if (tempHtmlPath) await unlink(tempHtmlPath).catch(() => {});
 
 	return {
 		buffer: screenshot,
