@@ -23,12 +23,10 @@ import { pathToFileURL } from "node:url";
 import puppeteer from "puppeteer-core";
 
 const CACHE_DIR = join(homedir(), ".pi", "cache", "markdown-preview");
-const RENDER_VERSION = "v6";
+const RENDER_VERSION = "v7";
 const VIEWPORT_WIDTH_PX = 1200;
-const MAX_CAPTURE_HEIGHT_PX = 2200;
-const MAX_CHARS_PER_PAGE = 5000;
-const MAX_LINES_PER_PAGE = 120;
-const MAX_PAGES = 8;
+const PAGE_HEIGHT_PX = 2200;
+const MAX_RENDER_HEIGHT_PX = 66000; // PAGE_HEIGHT_PX * 30
 
 type ThemeMode = "dark" | "light";
 type PreviewTarget = "terminal" | "browser";
@@ -65,6 +63,7 @@ interface RenderPreviewResult {
 interface CachedPage {
 	buffer: Buffer;
 	truncatedHeight: boolean;
+	pageCount?: number;
 }
 
 interface RenderWithLoaderResult {
@@ -245,39 +244,6 @@ function getLastAssistantMarkdown(ctx: ExtensionCommandContext): string | undefi
 	return messages.length > 0 ? messages[messages.length - 1]!.markdown : undefined;
 }
 
-function splitMarkdownIntoPages(markdown: string): { pages: string[]; truncated: boolean } {
-	const lines = markdown.split("\n");
-	const pages: string[] = [];
-	let current: string[] = [];
-	let currentChars = 0;
-
-	const flush = () => {
-		if (current.length === 0) return;
-		pages.push(current.join("\n"));
-		current = [];
-		currentChars = 0;
-	};
-
-	for (const line of lines) {
-		const nextChars = currentChars + line.length + 1;
-		if (current.length >= MAX_LINES_PER_PAGE || nextChars > MAX_CHARS_PER_PAGE) {
-			flush();
-		}
-		current.push(line);
-		currentChars += line.length + 1;
-		if (pages.length >= MAX_PAGES) break;
-	}
-	flush();
-
-	if (pages.length === 0) {
-		pages.push(markdown);
-	}
-
-	const consumedLines = pages.join("\n").split("\n").length;
-	const truncated = pages.length >= MAX_PAGES && consumedLines < lines.length;
-	return { pages: pages.slice(0, MAX_PAGES), truncated };
-}
-
 function normalizeMathDelimitersInSegment(markdown: string): string {
 	let normalized = markdown.replace(/\\\[\s*([\s\S]*?)\s*\\\]/g, (_match, expr: string) => {
 		const content = expr.trim();
@@ -401,11 +367,13 @@ async function readCachedPage(markdownPage: string, styleKey: string): Promise<C
 	try {
 		const buffer = await readFile(pngPath);
 		let truncatedHeight = false;
+		let pageCount: number | undefined;
 		if (existsSync(metaPath)) {
-			const meta = JSON.parse(await readFile(metaPath, "utf-8")) as { truncatedHeight?: boolean };
+			const meta = JSON.parse(await readFile(metaPath, "utf-8")) as { truncatedHeight?: boolean; pageCount?: number };
 			truncatedHeight = meta.truncatedHeight === true;
+			pageCount = meta.pageCount;
 		}
-		return { buffer, truncatedHeight };
+		return { buffer, truncatedHeight, pageCount };
 	} catch {
 		return undefined;
 	}
@@ -415,7 +383,9 @@ async function writeCachedPage(markdownPage: string, styleKey: string, page: Cac
 	const { pngPath, metaPath } = getCachePaths(markdownPage, styleKey);
 	await mkdir(CACHE_DIR, { recursive: true });
 	await writeFile(pngPath, page.buffer);
-	await writeFile(metaPath, JSON.stringify({ truncatedHeight: page.truncatedHeight }), "utf-8");
+	const meta: Record<string, unknown> = { truncatedHeight: page.truncatedHeight };
+	if (page.pageCount != null) meta.pageCount = page.pageCount;
+	await writeFile(metaPath, JSON.stringify(meta), "utf-8");
 }
 
 async function waitForPageRenderReady(page: puppeteer.Page): Promise<void> {
@@ -426,139 +396,166 @@ async function waitForPageRenderReady(page: puppeteer.Page): Promise<void> {
 	});
 }
 
-async function renderPageToPng(page: puppeteer.Page, markdownPage: string, style: PreviewStyle, resourcePath?: string): Promise<CachedPage> {
-	const normalizedMarkdown = normalizeMathDelimiters(markdownPage);
-	const fragmentHtml = await renderMarkdownToHtmlWithPandoc(normalizedMarkdown, resourcePath);
-	const html = buildBrowserHtmlFromPandocFragment(fragmentHtml, style, resourcePath);
-
-	// When resourcePath is set, write HTML to a temp file so Chromium can
-	// resolve file:// image URLs. setContent() uses about:blank which blocks
-	// file:// access.
-	let tempHtmlPath: string | undefined;
-	const loadHtml = async () => {
-		if (resourcePath) {
-			if (!tempHtmlPath) {
-				tempHtmlPath = join(CACHE_DIR, `_render_tmp_${Date.now()}.html`);
-				await writeFile(tempHtmlPath, html, "utf-8");
-			}
-			await page.goto(pathToFileURL(tempHtmlPath).href, { waitUntil: "domcontentloaded" });
-		} else {
-			await page.setContent(html, { waitUntil: "domcontentloaded" });
-		}
-		await waitForPageRenderReady(page);
-	};
-
-	await page.setViewport({
-		width: VIEWPORT_WIDTH_PX,
-		height: 900,
-		deviceScaleFactor: 2,
-	});
-
-	await loadHtml();
-
-	const contentHeight = await page.evaluate(() => {
-		const root = document.getElementById("preview-root");
-		if (!root) return 900;
-		const rect = root.getBoundingClientRect();
-		return Math.ceil(rect.height + 40);
-	});
-
-	const captureHeight = Math.max(500, Math.min(MAX_CAPTURE_HEIGHT_PX, contentHeight));
-
-	if (captureHeight !== 900) {
-		await page.setViewport({
-			width: VIEWPORT_WIDTH_PX,
-			height: captureHeight,
-			deviceScaleFactor: 2,
-		});
-		await loadHtml();
-	}
-
-	const screenshot = (await page.screenshot({
-		type: "png",
-	})) as Buffer;
-
-	if (tempHtmlPath) await unlink(tempHtmlPath).catch(() => {});
-
-	return {
-		buffer: screenshot,
-		truncatedHeight: contentHeight > MAX_CAPTURE_HEIGHT_PX,
-	};
-}
-
 async function renderPreview(markdown: string, style: PreviewStyle, signal?: AbortSignal, resourcePath?: string, skipCache?: boolean): Promise<RenderPreviewResult> {
-	const split = splitMarkdownIntoPages(markdown);
-	const pages = split.pages;
-	const rendered: PreviewPage[] = new Array(pages.length);
+	const normalizedMarkdown = normalizeMathDelimiters(markdown);
+
+	// Check cache for the full render (keyed on full markdown content).
+	const cached = skipCache ? undefined : await readCachedPage(normalizedMarkdown, style.cacheKey);
+	if (cached) {
+		// Cached result stores page count in meta; individual page PNGs are stored separately.
+		const meta = cached as CachedPage & { pageCount?: number };
+		const pageCount = meta.pageCount ?? 1;
+		const pages: PreviewPage[] = [];
+		for (let i = 0; i < pageCount; i++) {
+			const pageKey = `${normalizedMarkdown}\u0000page${i}`;
+			const pageCached = i === 0 ? cached : await readCachedPage(pageKey, style.cacheKey);
+			if (!pageCached) {
+				// Cache is incomplete; re-render.
+				return renderPreview(markdown, style, signal, resourcePath, true);
+			}
+			pages.push({
+				base64Png: pageCached.buffer.toString("base64"),
+				truncatedHeight: pageCached.truncatedHeight,
+				index: i,
+				total: pageCount,
+			});
+		}
+		return { pages, themeMode: style.themeMode, truncatedPages: false };
+	}
 
 	await mkdir(CACHE_DIR, { recursive: true });
 
+	const fragmentHtml = await renderMarkdownToHtmlWithPandoc(normalizedMarkdown, resourcePath);
+	const html = buildBrowserHtmlFromPandocFragment(fragmentHtml, style, resourcePath);
+
 	let browser: puppeteer.Browser | undefined;
 	let browserPage: puppeteer.Page | undefined;
+	let tempHtmlPath: string | undefined;
 
 	try {
-		for (let i = 0; i < pages.length; i++) {
-			if (signal?.aborted) {
-				throw new Error("Preview rendering cancelled.");
-			}
+		if (signal?.aborted) throw new Error("Preview rendering cancelled.");
 
-			const markdownPage = pages[i]!;
-			let pageResult = skipCache ? undefined : await readCachedPage(markdownPage, style.cacheKey);
+		const executablePath = findBrowserExecutable();
+		if (!executablePath) {
+			throw new Error(
+				"No Chromium-based browser was found. Set PUPPETEER_EXECUTABLE_PATH to your Chrome/Edge/Chromium binary.",
+			);
+		}
 
-			if (!pageResult) {
-				if (!browser) {
-					const executablePath = findBrowserExecutable();
-					if (!executablePath) {
-						throw new Error(
-							"No Chromium-based browser was found. Set PUPPETEER_EXECUTABLE_PATH to your Chrome/Edge/Chromium binary.",
-						);
-					}
+		const args = ["--disable-gpu", "--font-render-hinting=medium"];
+		if (process.platform === "linux") {
+			args.push("--no-sandbox", "--disable-setuid-sandbox");
+		}
 
-					const args = ["--disable-gpu", "--font-render-hinting=medium"];
-					if (process.platform === "linux") {
-						args.push("--no-sandbox", "--disable-setuid-sandbox");
-					}
+		browser = await puppeteer.launch({ headless: true, executablePath, args });
+		browserPage = await browser.newPage();
 
-					browser = await puppeteer.launch({
-						headless: true,
-						executablePath,
-						args,
-					});
-					browserPage = await browser.newPage();
+		const loadHtml = async (height: number) => {
+			await browserPage!.setViewport({
+				width: VIEWPORT_WIDTH_PX,
+				height,
+				deviceScaleFactor: 2,
+			});
+			if (resourcePath) {
+				if (!tempHtmlPath) {
+					tempHtmlPath = join(CACHE_DIR, `_render_tmp_${Date.now()}.html`);
+					await writeFile(tempHtmlPath, html, "utf-8");
 				}
-
-				pageResult = await renderPageToPng(browserPage!, markdownPage, style, resourcePath);
-				await writeCachedPage(markdownPage, style.cacheKey, pageResult).catch(() => {
-					// Cache write failures should not break rendering.
-				});
+				await browserPage!.goto(pathToFileURL(tempHtmlPath).href, { waitUntil: "domcontentloaded" });
+			} else {
+				await browserPage!.setContent(html, { waitUntil: "domcontentloaded" });
 			}
+			await waitForPageRenderReady(browserPage!);
+		};
 
-			rendered[i] = {
-				base64Png: pageResult.buffer.toString("base64"),
-				truncatedHeight: pageResult.truncatedHeight,
-				index: i,
-				total: pages.length,
-			};
+		// First pass: measure content height.
+		await loadHtml(900);
+		const contentHeight = await browserPage.evaluate(() => {
+			const root = document.getElementById("preview-root");
+			if (!root) return 900;
+			const rect = root.getBoundingClientRect();
+			return Math.ceil(rect.height + 40);
+		});
+
+		if (signal?.aborted) throw new Error("Preview rendering cancelled.");
+
+		// Clamp to maximum render height.
+		const renderHeight = Math.max(500, Math.min(MAX_RENDER_HEIGHT_PX, contentHeight));
+		const truncatedPages = contentHeight > MAX_RENDER_HEIGHT_PX;
+
+		// Second pass: render at full height.
+		if (renderHeight !== 900) {
+			await loadHtml(renderHeight);
 		}
+
+		// Take full screenshot and slice into pages.
+		const fullScreenshot = (await browserPage.screenshot({ type: "png" })) as Buffer;
+
+		if (tempHtmlPath) await unlink(tempHtmlPath).catch(() => {});
+		tempHtmlPath = undefined;
+
+		// Import sharp-like slicing via puppeteer clip regions, or slice the
+		// full PNG by re-screenshotting with clip.  Since we already have the
+		// full page loaded, clip is simplest.
+		const pageCount = Math.max(1, Math.ceil(renderHeight / PAGE_HEIGHT_PX));
+		const pages: PreviewPage[] = [];
+
+		if (pageCount === 1) {
+			// Single page — use the full screenshot directly.
+			pages.push({
+				base64Png: fullScreenshot.toString("base64"),
+				truncatedHeight: false,
+				index: 0,
+				total: 1,
+			});
+			await writeCachedPage(normalizedMarkdown, style.cacheKey, {
+				buffer: fullScreenshot,
+				truncatedHeight: false,
+				pageCount: 1,
+			}).catch(() => {});
+		} else {
+			// Multiple pages — use clip regions.
+			for (let i = 0; i < pageCount; i++) {
+				if (signal?.aborted) throw new Error("Preview rendering cancelled.");
+
+				const y = i * PAGE_HEIGHT_PX;
+				const height = Math.min(PAGE_HEIGHT_PX, renderHeight - y);
+
+				const pageScreenshot = (await browserPage.screenshot({
+					type: "png",
+					clip: {
+						x: 0,
+						y,
+						width: VIEWPORT_WIDTH_PX,
+						height,
+					},
+				})) as Buffer;
+
+				pages.push({
+					base64Png: pageScreenshot.toString("base64"),
+					truncatedHeight: false,
+					index: i,
+					total: pageCount,
+				});
+
+				// Cache each page slice.
+				const pageKey = i === 0 ? normalizedMarkdown : `${normalizedMarkdown}\u0000page${i}`;
+				await writeCachedPage(pageKey, style.cacheKey, {
+					buffer: pageScreenshot,
+					truncatedHeight: false,
+					pageCount: i === 0 ? pageCount : undefined,
+				}).catch(() => {});
+			}
+		}
+
+		return { pages, themeMode: style.themeMode, truncatedPages };
 	} finally {
-		if (browserPage) {
-			await browserPage.close().catch(() => {
-				// no-op
-			});
-		}
-		if (browser) {
-			await browser.close().catch(() => {
-				// no-op
-			});
-		}
+		if (tempHtmlPath) await unlink(tempHtmlPath).catch(() => {});
+		if (browserPage) await browserPage.close().catch(() => {});
+		if (browser) await browser.close().catch(() => {});
 	}
-
-	return {
-		pages: rendered,
-		themeMode: style.themeMode,
-		truncatedPages: split.truncated,
-	};
 }
+
 
 class MarkdownPreviewOverlay {
 	private container = new Container();
