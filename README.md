@@ -2,6 +2,23 @@
 
 Rendered markdown and LaTeX preview for [pi](https://github.com/badlogic/pi-mono). Preview assistant responses or arbitrary markdown files directly in your terminal or browser, with full math rendering, syntax highlighting, and theme-aware styling.
 
+## Screenshots
+
+**Dark theme — terminal inline preview:**
+
+![Dark terminal preview](screenshots/dark-terminal.png)
+
+**Light theme — terminal inline preview:**
+
+![Light terminal preview](screenshots/light-terminal.png)
+
+**Browser preview (dark / light):**
+
+<p float="left">
+  <img src="screenshots/dark-browser.png" width="49%" />
+  <img src="screenshots/light-browser.png" width="49%" />
+</p>
+
 ## Features
 
 - **Terminal preview** — renders markdown as PNG images displayed inline (Kitty, iTerm2, Ghostty, WezTerm)

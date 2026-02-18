@@ -12,7 +12,8 @@
   "pi": {
     "extensions": [
       "./index.ts"
-    ]
+    ],
+    "image": "screenshots/dark-terminal.png"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
