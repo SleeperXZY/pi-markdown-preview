@@ -965,9 +965,8 @@ async function renderMarkdownToHtmlWithPandoc(markdown: string, resourcePath?: s
 
 async function renderMarkdownToPdf(markdown: string, outputPath: string, resourcePath?: string): Promise<void> {
 	const pandocCommand = process.env.PANDOC_PATH?.trim() || "pandoc";
-	const pdfEngine = process.env.PANDOC_PDF_ENGINE?.trim();
-	const args = ["-f", "gfm+tex_math_dollars", "-o", outputPath];
-	if (pdfEngine) args.push(`--pdf-engine=${pdfEngine}`);
+	const pdfEngine = process.env.PANDOC_PDF_ENGINE?.trim() || "xelatex";
+	const args = ["-f", "gfm+tex_math_dollars", "-o", outputPath, `--pdf-engine=${pdfEngine}`];
 	if (resourcePath) args.push(`--resource-path=${resourcePath}`);
 
 	return await new Promise<void>((resolve, reject) => {

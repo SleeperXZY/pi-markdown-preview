@@ -88,7 +88,7 @@ Set `PANDOC_PATH` if pandoc is not on your `PATH`:
 export PANDOC_PATH=/usr/local/bin/pandoc
 ```
 
-Set `PANDOC_PDF_ENGINE` to override the LaTeX engine used for PDF export (default: pandoc's default, typically `pdflatex`):
+Set `PANDOC_PDF_ENGINE` to override the LaTeX engine used for PDF export (default: `xelatex`):
 
 ```bash
 export PANDOC_PDF_ENGINE=xelatex
