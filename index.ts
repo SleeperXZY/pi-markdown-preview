@@ -1172,8 +1172,41 @@ async function openPreviewInBrowser(ctx: ExtensionCommandContext, markdownOverri
 	await openFileInDefaultBrowser(htmlPath);
 }
 
+function tokenizeArgs(input: string): string[] {
+	const tokens: string[] = [];
+	const s = input.trim();
+	let i = 0;
+
+	while (i < s.length) {
+		while (i < s.length && /\s/.test(s[i]!)) i++;
+		if (i >= s.length) break;
+
+		const ch = s[i]!;
+		if (ch === '"' || ch === "'") {
+			const quote = ch;
+			i++;
+			let token = "";
+			while (i < s.length && s[i] !== quote) {
+				token += s[i];
+				i++;
+			}
+			if (i < s.length) i++; // skip closing quote
+			tokens.push(token);
+		} else {
+			let token = "";
+			while (i < s.length && !/\s/.test(s[i]!)) {
+				token += s[i];
+				i++;
+			}
+			tokens.push(token);
+		}
+	}
+
+	return tokens;
+}
+
 function parsePreviewArgs(args: string): { target?: PreviewTarget; pick?: boolean; file?: string; help?: boolean; error?: string } {
-	const tokens = args.trim().length === 0 ? [] : args.trim().split(/\s+/);
+	const tokens = tokenizeArgs(args);
 	let target: PreviewTarget = "terminal";
 	let explicitTarget = false;
 	let pick = false;
