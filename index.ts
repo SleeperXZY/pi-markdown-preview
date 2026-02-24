@@ -1306,7 +1306,10 @@ export default function (pi: ExtensionAPI) {
 		let resourcePath: string | undefined;
 		if (parsed.file) {
 			try {
-				const filePath = resolvePath(parsed.file);
+				const expanded = parsed.file.startsWith("~/") ? join(homedir(), parsed.file.slice(2))
+					: parsed.file === "~" ? homedir()
+					: parsed.file;
+				const filePath = resolvePath(expanded);
 				markdown = await readFile(filePath, "utf-8");
 				resourcePath = dirname(filePath);
 			} catch (error) {
