@@ -963,10 +963,41 @@ async function renderMarkdownToHtmlWithPandoc(markdown: string, resourcePath?: s
 	});
 }
 
+const PDF_PREAMBLE = `\\usepackage{titlesec}
+\\titleformat{\\section}{\\Large\\bfseries\\sffamily}{}{0pt}{}[\\vspace{2pt}\\titlerule]
+\\titleformat{\\subsection}{\\large\\bfseries\\sffamily}{}{0pt}{}
+\\titleformat{\\subsubsection}{\\normalsize\\bfseries\\sffamily}{}{0pt}{}
+\\titlespacing*{\\section}{0pt}{1.5ex plus 0.5ex minus 0.2ex}{1ex plus 0.2ex}
+\\titlespacing*{\\subsection}{0pt}{1.2ex plus 0.4ex minus 0.2ex}{0.6ex plus 0.1ex}
+\\usepackage{enumitem}
+\\setlist[itemize]{nosep, leftmargin=1.5em}
+\\setlist[enumerate]{nosep, leftmargin=1.5em}
+\\usepackage{parskip}
+`;
+
+const PDF_PREAMBLE_PATH = join(CACHE_DIR, "_pdf_preamble.tex");
+
+async function ensurePdfPreamble(): Promise<string> {
+	await mkdir(CACHE_DIR, { recursive: true });
+	await writeFile(PDF_PREAMBLE_PATH, PDF_PREAMBLE, "utf-8");
+	return PDF_PREAMBLE_PATH;
+}
+
 async function renderMarkdownToPdf(markdown: string, outputPath: string, resourcePath?: string): Promise<void> {
 	const pandocCommand = process.env.PANDOC_PATH?.trim() || "pandoc";
 	const pdfEngine = process.env.PANDOC_PDF_ENGINE?.trim() || "xelatex";
-	const args = ["-f", "gfm+tex_math_dollars", "-o", outputPath, `--pdf-engine=${pdfEngine}`];
+	const preamblePath = await ensurePdfPreamble();
+	const args = [
+		"-f", "gfm+tex_math_dollars",
+		"-o", outputPath,
+		`--pdf-engine=${pdfEngine}`,
+		"-V", "geometry:margin=2.2cm",
+		"-V", "fontsize=11pt",
+		"-V", "linestretch=1.25",
+		"-V", "urlcolor=blue",
+		"-V", "linkcolor=blue",
+		"--include-in-header", preamblePath,
+	];
 	if (resourcePath) args.push(`--resource-path=${resourcePath}`);
 
 	return await new Promise<void>((resolve, reject) => {
