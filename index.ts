@@ -29,7 +29,7 @@ const PAGE_HEIGHT_PX = 2200;
 const MAX_RENDER_HEIGHT_PX = 66000; // PAGE_HEIGHT_PX * 30
 
 type ThemeMode = "dark" | "light";
-type PreviewTarget = "terminal" | "browser";
+type PreviewTarget = "terminal" | "browser" | "pdf";
 
 interface PreviewPalette {
 	bg: string;
@@ -963,6 +963,81 @@ async function renderMarkdownToHtmlWithPandoc(markdown: string, resourcePath?: s
 	});
 }
 
+async function renderMarkdownToPdf(markdown: string, outputPath: string, resourcePath?: string): Promise<void> {
+	const pandocCommand = process.env.PANDOC_PATH?.trim() || "pandoc";
+	const pdfEngine = process.env.PANDOC_PDF_ENGINE?.trim();
+	const args = ["-f", "gfm+tex_math_dollars", "-o", outputPath];
+	if (pdfEngine) args.push(`--pdf-engine=${pdfEngine}`);
+	if (resourcePath) args.push(`--resource-path=${resourcePath}`);
+
+	return await new Promise<void>((resolve, reject) => {
+		const child = spawn(pandocCommand, args, { stdio: ["pipe", "pipe", "pipe"] });
+		const stderrChunks: Buffer[] = [];
+		let settled = false;
+
+		const fail = (error: Error) => {
+			if (settled) return;
+			settled = true;
+			reject(error);
+		};
+
+		child.stderr.on("data", (chunk: Buffer | string) => {
+			stderrChunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+		});
+
+		child.once("error", (error) => {
+			const errno = error as NodeJS.ErrnoException;
+			if (errno.code === "ENOENT") {
+				fail(
+					new Error(
+						`pandoc was not found. Install pandoc or set PANDOC_PATH to the pandoc binary.`,
+					),
+				);
+				return;
+			}
+			fail(error);
+		});
+
+		child.once("close", (code) => {
+			if (settled) return;
+			settled = true;
+			if (code === 0) {
+				resolve();
+				return;
+			}
+			const stderr = Buffer.concat(stderrChunks).toString("utf-8").trim();
+			const hint = stderr.includes("not found") || stderr.includes("pdflatex") || stderr.includes("xelatex")
+				? "\nPDF export requires a LaTeX engine. Install TeX Live (brew install --cask mactex / apt install texlive) or set PANDOC_PDF_ENGINE to your preferred engine."
+				: "";
+			fail(new Error(`pandoc PDF export failed with exit code ${code}${stderr ? `: ${stderr}` : ""}${hint}`));
+		});
+
+		child.stdin.end(markdown);
+	});
+}
+
+async function exportPdf(ctx: ExtensionCommandContext, markdownOverride?: string, resourcePath?: string): Promise<void> {
+	const markdown = markdownOverride ?? getLastAssistantMarkdown(ctx);
+	if (!markdown) {
+		ctx.ui.notify("No assistant markdown found in the current branch.", "warning");
+		return;
+	}
+
+	const normalizedMarkdown = normalizeMathDelimiters(markdown);
+	const hash = createHash("sha256")
+		.update(RENDER_VERSION)
+		.update("\u0000")
+		.update("pdf")
+		.update("\u0000")
+		.update(normalizedMarkdown)
+		.digest("hex");
+	const pdfPath = join(CACHE_DIR, `${hash}.pdf`);
+
+	await mkdir(CACHE_DIR, { recursive: true });
+	await renderMarkdownToPdf(normalizedMarkdown, pdfPath, resourcePath);
+	await openFileInDefaultBrowser(pdfPath);
+}
+
 function buildBrowserHtmlFromPandocFragment(fragmentHtml: string, style: PreviewStyle, resourcePath?: string): string {
 	const palette = style.palette;
 	const baseTag = resourcePath ? `\n<base href="${pathToFileURL(resourcePath + "/").href}" />` : "";
@@ -1135,16 +1210,25 @@ function parsePreviewArgs(args: string): { target?: PreviewTarget; pick?: boolea
 			token === "native"
 		) {
 			if (explicitTarget && target !== "browser") {
-				return { error: "Conflicting output targets. Choose terminal or browser." };
+				return { error: "Conflicting output targets. Choose one of terminal, browser, or pdf." };
 			}
 			target = "browser";
 			explicitTarget = true;
 			continue;
 		}
 
+		if (token === "--pdf" || token === "pdf") {
+			if (explicitTarget && target !== "pdf") {
+				return { error: "Conflicting output targets. Choose one of terminal, browser, or pdf." };
+			}
+			target = "pdf";
+			explicitTarget = true;
+			continue;
+		}
+
 		if (token === "--terminal" || token === "terminal") {
 			if (explicitTarget && target !== "terminal") {
-				return { error: "Conflicting output targets. Choose terminal or browser." };
+				return { error: "Conflicting output targets. Choose one of terminal, browser, or pdf." };
 			}
 			target = "terminal";
 			explicitTarget = true;
@@ -1161,7 +1245,7 @@ function parsePreviewArgs(args: string): { target?: PreviewTarget; pick?: boolea
 			continue;
 		}
 
-		return { error: `Unknown argument \"${token}\". Use /preview [--pick|-p] [--file|-f <path>] [--browser]` };
+		return { error: `Unknown argument \"${token}\". Use /preview [--pick|-p] [--file|-f <path>] [--browser] [--pdf]` };
 	}
 
 	if (file && pick) {
@@ -1175,7 +1259,7 @@ export default function (pi: ExtensionAPI) {
 	const run = async (args: string, ctx: ExtensionCommandContext) => {
 		const parsed = parsePreviewArgs(args);
 		if (parsed.help) {
-			ctx.ui.notify("Usage: /preview [--pick|-p] [--file|-f <path>] [--browser]  or  /preview <path>", "info");
+			ctx.ui.notify("Usage: /preview [--pick|-p] [--file|-f <path>] [--browser] [--pdf]  or  /preview <path>", "info");
 			return;
 		}
 		if (parsed.error || !parsed.target) {
@@ -1213,6 +1297,18 @@ export default function (pi: ExtensionAPI) {
 			}
 			return;
 		}
+
+		if (parsed.target === "pdf") {
+			try {
+				await exportPdf(ctx, markdown, resourcePath);
+				ctx.ui.notify("Opened PDF preview.", "info");
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				ctx.ui.notify(`PDF export failed: ${message}`, "error");
+			}
+			return;
+		}
+
 		await openPreview(ctx, markdown, resourcePath);
 	};
 
@@ -1228,7 +1324,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.registerCommand("preview", {
-		description: "Rendered markdown preview (--pick select response, --file <path> or bare path, --browser for external)",
+		description: "Rendered markdown preview (--pick select response, --file <path> or bare path, --browser for HTML, --pdf for PDF)",
 		handler: run,
 	});
 
@@ -1240,5 +1336,14 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("preview-browser", {
 		description: "Open rendered markdown + LaTeX preview in the default browser (native MathML via pandoc)",
 		handler: runBrowser,
+	});
+
+	pi.registerCommand("preview-pdf", {
+		description: "Export markdown to PDF via pandoc + LaTeX and open it",
+		handler: async (args, ctx) => {
+			await ctx.waitForIdle();
+			// Re-use the main run handler with --pdf prepended
+			await run(`--pdf ${args}`.trim(), ctx);
+		},
 	});
 }

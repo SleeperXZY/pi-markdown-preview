@@ -25,7 +25,8 @@ Preview adapts to your pi theme. Examples in dark and light:
 
 - **Terminal preview** — renders markdown as PNG images displayed inline (Kitty, iTerm2, Ghostty, WezTerm). Long responses are automatically split across navigable pages.
 - **Browser preview** — opens rendered HTML in your default browser as a single continuous scrollable document
-- **LaTeX/math support** — renders `$inline$` and `$$display$$` math via MathML
+- **PDF export** — exports markdown to PDF via pandoc + LaTeX and opens it in your default PDF viewer
+- **LaTeX/math support** — renders `$inline$` and `$$display$$` math via MathML (browser/terminal) or native LaTeX (PDF)
 - **Theme-aware** — matches your pi theme (dark/light, accent colours)
 - **Response picker** — select any past assistant response to preview, not just the latest
 - **File preview** — preview arbitrary `.md` files from the filesystem
@@ -36,6 +37,7 @@ Preview adapts to your pi theme. Examples in dark and light:
 - A Chromium-based browser (Chrome, Brave, Edge, Chromium)
 - [Pandoc](https://pandoc.org/installing.html) (`brew install pandoc` on macOS)
 - A terminal with image support (Ghostty, Kitty, iTerm2, WezTerm) for inline preview
+- A LaTeX engine for PDF export (optional): [TeX Live](https://tug.org/texlive/) (`brew install --cask mactex` on macOS, `apt install texlive` on Linux)
 
 ## Install
 
@@ -64,6 +66,9 @@ pi -e https://github.com/omaclaren/pi-markdown-preview
 | `/preview README.md` | Preview a markdown file |
 | `/preview --file ./docs/guide.md` | Preview a file (explicit flag) |
 | `/preview --browser` | Open preview in default browser |
+| `/preview --pdf` | Export to PDF and open |
+| `/preview-pdf` | Shortcut for `--pdf` |
+| `/preview --pdf README.md` | Export a file to PDF |
 | `/preview --pick --browser` | Pick a response, open in browser |
 
 ### Keyboard shortcuts (terminal preview)
@@ -81,6 +86,12 @@ Set `PANDOC_PATH` if pandoc is not on your `PATH`:
 
 ```bash
 export PANDOC_PATH=/usr/local/bin/pandoc
+```
+
+Set `PANDOC_PDF_ENGINE` to override the LaTeX engine used for PDF export (default: pandoc's default, typically `pdflatex`):
+
+```bash
+export PANDOC_PDF_ENGINE=xelatex
 ```
 
 Set `PUPPETEER_EXECUTABLE_PATH` to override browser detection:
