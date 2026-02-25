@@ -23,7 +23,7 @@ import { pathToFileURL } from "node:url";
 import puppeteer from "puppeteer-core";
 
 const CACHE_DIR = join(homedir(), ".pi", "cache", "markdown-preview");
-const RENDER_VERSION = "v7";
+const RENDER_VERSION = "v9";
 const VIEWPORT_WIDTH_PX = 1200;
 const PAGE_HEIGHT_PX = 2200;
 const MAX_RENDER_HEIGHT_PX = 66000; // PAGE_HEIGHT_PX * 30
@@ -463,16 +463,16 @@ async function renderPreview(markdown: string, style: PreviewStyle, signal?: Abo
 				height,
 				deviceScaleFactor: 2,
 			});
-			if (resourcePath) {
-				if (!tempHtmlPath) {
-					tempHtmlPath = join(CACHE_DIR, `_render_tmp_${Date.now()}.html`);
-					await writeFile(tempHtmlPath, html, "utf-8");
-				}
-				await browserPage!.goto(pathToFileURL(tempHtmlPath).href, { waitUntil: "domcontentloaded" });
-			} else {
-				await browserPage!.setContent(html, { waitUntil: "domcontentloaded" });
+			if (!tempHtmlPath) {
+				tempHtmlPath = join(CACHE_DIR, `_render_tmp_${Date.now()}.html`);
+				await writeFile(tempHtmlPath, html, "utf-8");
 			}
+			await browserPage!.goto(pathToFileURL(tempHtmlPath).href, { waitUntil: "domcontentloaded" });
 			await waitForPageRenderReady(browserPage!);
+			await browserPage!.waitForFunction(
+				"window.__mermaidDone === true",
+				{ timeout: 15000 }
+			).catch(() => {});
 		};
 
 		// First pass: measure content height.
@@ -1060,6 +1060,10 @@ async function exportPdf(ctx: ExtensionCommandContext, markdownOverride?: string
 		return;
 	}
 
+	if (/```mermaid\b/i.test(markdown)) {
+		ctx.ui.notify("Mermaid diagrams are not rendered in PDF output. Use --browser for full mermaid support.", "warning");
+	}
+
 	const normalizedMarkdown = normalizeObsidianImages(normalizeMathDelimiters(markdown));
 	const hash = createHash("sha256")
 		.update(RENDER_VERSION)
@@ -1175,10 +1179,48 @@ body {
   overflow-x: auto;
   overflow-y: hidden;
 }
+#preview-root .mermaid-container {
+  text-align: center;
+  margin: 1em 0;
+  overflow-x: auto;
+}
+#preview-root .mermaid-container svg {
+  max-width: 100%;
+  height: auto;
+}
 </style>
 </head>
 <body>
   <article id="preview-root">${fragmentHtml}</article>
+  <script type="module">
+  (async () => {
+    const mermaidBlocks = document.querySelectorAll('pre.mermaid');
+    if (mermaidBlocks.length === 0) {
+      window.__mermaidDone = true;
+      return;
+    }
+    try {
+      const { default: mermaid } = await import('https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs');
+      mermaid.initialize({
+        startOnLoad: false,
+        theme: '${style.themeMode === "dark" ? "dark" : "default"}',
+      });
+      mermaidBlocks.forEach(pre => {
+        const code = pre.querySelector('code');
+        const src = code ? code.textContent : pre.textContent;
+        const wrapper = document.createElement('div');
+        wrapper.className = 'mermaid-container';
+        const div = document.createElement('div');
+        div.className = 'mermaid';
+        div.textContent = src;
+        wrapper.appendChild(div);
+        pre.replaceWith(wrapper);
+      });
+      await mermaid.run();
+    } catch (e) { console.error('Mermaid render failed:', e); }
+    window.__mermaidDone = true;
+  })();
+  </script>
 </body>
 </html>`;
 }
