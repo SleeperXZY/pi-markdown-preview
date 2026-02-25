@@ -307,6 +307,13 @@ function normalizeMathDelimiters(markdown: string): string {
 	return out.join("\n");
 }
 
+function normalizeObsidianImages(markdown: string): string {
+	// Convert ![[path|alt]] and ![[path]] to standard markdown ![alt](path)
+	return markdown
+		.replace(/!\[\[([^|\]]+)\|([^\]]+)\]\]/g, "![$2]($1)")
+		.replace(/!\[\[([^\]]+)\]\]/g, "![]($1)");
+}
+
 function getBrowserCandidates(): string[] {
 	if (process.platform === "darwin") {
 		return [
@@ -397,7 +404,7 @@ async function waitForPageRenderReady(page: puppeteer.Page): Promise<void> {
 }
 
 async function renderPreview(markdown: string, style: PreviewStyle, signal?: AbortSignal, resourcePath?: string, skipCache?: boolean): Promise<RenderPreviewResult> {
-	const normalizedMarkdown = normalizeMathDelimiters(markdown);
+	const normalizedMarkdown = normalizeObsidianImages(normalizeMathDelimiters(markdown));
 
 	// Check cache for the full render (keyed on full markdown content).
 	const cached = skipCache ? undefined : await readCachedPage(normalizedMarkdown, style.cacheKey);
@@ -1053,7 +1060,7 @@ async function exportPdf(ctx: ExtensionCommandContext, markdownOverride?: string
 		return;
 	}
 
-	const normalizedMarkdown = normalizeMathDelimiters(markdown);
+	const normalizedMarkdown = normalizeObsidianImages(normalizeMathDelimiters(markdown));
 	const hash = createHash("sha256")
 		.update(RENDER_VERSION)
 		.update("\u0000")
@@ -1183,7 +1190,7 @@ async function openPreviewInBrowser(ctx: ExtensionCommandContext, markdownOverri
 	}
 
 	const style = getPreviewStyle(ctx.ui.theme);
-	const normalizedMarkdown = normalizeMathDelimiters(markdown);
+	const normalizedMarkdown = normalizeObsidianImages(normalizeMathDelimiters(markdown));
 	const fragmentHtml = await renderMarkdownToHtmlWithPandoc(normalizedMarkdown, resourcePath);
 	const html = buildBrowserHtmlFromPandocFragment(fragmentHtml, style, resourcePath);
 	const hash = createHash("sha256")
