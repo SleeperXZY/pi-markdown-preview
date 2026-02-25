@@ -26,11 +26,14 @@ Preview adapts to your pi theme. Examples in dark and light:
 - **Terminal preview** — renders markdown as PNG images displayed inline (Kitty, iTerm2, Ghostty, WezTerm). Long responses are automatically split across navigable pages.
 - **Browser preview** — opens rendered HTML in your default browser as a single continuous scrollable document
 - **PDF export** — exports markdown to PDF via pandoc + LaTeX and opens it in your default PDF viewer
+- **Mermaid diagrams** — renders ` ```mermaid` code blocks as SVG diagrams in terminal and browser previews (dark/light theme aware)
 - **LaTeX/math support** — renders `$inline$` and `$$display$$` math via MathML (browser/terminal) or native LaTeX (PDF)
 - **Theme-aware** — matches your pi theme (dark/light, accent colours)
 - **Response picker** — select any past assistant response to preview, not just the latest
 - **File preview** — preview arbitrary `.md` files from the filesystem
 - **Caching** — rendered pages are cached for instant re-display; refresh (`r`) bypasses cache
+
+> **Note:** Mermaid diagrams are not currently rendered in PDF output (the LaTeX pipeline does not support them). Use `--browser` for full mermaid support.
 
 ## Prerequisites
 
