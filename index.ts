@@ -1611,17 +1611,6 @@ export default function (pi: ExtensionAPI) {
 		await openPreview(ctx, markdown, resourcePath);
 	};
 
-	const runBrowser = async (_args: string, ctx: ExtensionCommandContext) => {
-		await ctx.waitForIdle();
-		try {
-			await openPreviewInBrowser(ctx);
-			ctx.ui.notify("Opened preview in browser.", "info");
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			ctx.ui.notify(`Browser preview failed: ${message}`, "error");
-		}
-	};
-
 	pi.registerCommand("preview", {
 		description: "Rendered markdown preview (--pick select response, --file <path> or bare path, --browser for HTML, --pdf for PDF)",
 		handler: run,
@@ -1634,7 +1623,10 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("preview-browser", {
 		description: "Open rendered markdown + LaTeX preview in the default browser (native MathML via pandoc)",
-		handler: runBrowser,
+		handler: async (args, ctx) => {
+			await ctx.waitForIdle();
+			await run(`--browser ${args}`.trim(), ctx);
+		},
 	});
 
 	pi.registerCommand("preview-pdf", {
