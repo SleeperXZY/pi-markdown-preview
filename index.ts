@@ -1541,7 +1541,7 @@ function parsePreviewArgs(args: string): { target?: PreviewTarget; pick?: boolea
 			continue;
 		}
 
-		return { error: `Unknown argument \"${token}\". Use /preview [--pick|-p] [--file|-f <path>] [--browser] [--pdf]` };
+		return { error: `Unknown argument \"${token}\". Use /preview [--pick|-p] [--file|-f <path>] [--browser] [--pdf] [--terminal]` };
 	}
 
 	if (file && pick) {
@@ -1555,7 +1555,7 @@ export default function (pi: ExtensionAPI) {
 	const run = async (args: string, ctx: ExtensionCommandContext) => {
 		const parsed = parsePreviewArgs(args);
 		if (parsed.help) {
-			ctx.ui.notify("Usage: /preview [--pick|-p] [--file|-f <path>] [--browser] [--pdf]  or  /preview <path>", "info");
+			ctx.ui.notify("Usage: /preview [--pick|-p] [--file|-f <path>] [--browser] [--pdf] [--terminal]  or  /preview <path>", "info");
 			return;
 		}
 		if (parsed.error || !parsed.target) {
@@ -1612,7 +1612,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.registerCommand("preview", {
-		description: "Rendered markdown preview (--pick select response, --file <path> or bare path, --browser for HTML, --pdf for PDF)",
+		description: "Rendered markdown preview (--pick select response, --file <path> or bare path, --browser for HTML, --pdf for PDF, --terminal to force inline)",
 		handler: run,
 	});
 

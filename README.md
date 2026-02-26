@@ -64,14 +64,33 @@ pi -e https://github.com/omaclaren/pi-markdown-preview
 | Command | Description |
 |---------|-------------|
 | `/preview` | Preview the latest assistant response in terminal |
+| `/preview-md` | Alias for `/preview` |
 | `/preview --pick` | Select from all assistant responses |
 | `/preview README.md` | Preview a markdown file |
 | `/preview --file ./docs/guide.md` | Preview a file (explicit flag) |
 | `/preview --browser` | Open preview in default browser |
+| `/preview-browser` | Shortcut for browser preview |
+| `/preview-browser README.md` | Open a file preview in browser |
 | `/preview --pdf` | Export to PDF and open |
 | `/preview-pdf` | Shortcut for `--pdf` |
 | `/preview --pdf README.md` | Export a file to PDF |
+| `/preview --terminal` | Force terminal preview output |
 | `/preview --pick --browser` | Pick a response, open in browser |
+
+Additional accepted argument aliases:
+- Pick: `-p`, `pick`
+- File: `-f`
+- Browser target: `browser`, `--external`, `external`, `--browser-native`, `native`
+- PDF target: `pdf`
+- Terminal target: `terminal`
+- Help: `--help`, `-h`, `help`
+- Note: `--pick` and `--file` cannot be used together
+
+To validate command docs against implementation:
+
+```bash
+npm run check:readme-commands
+```
 
 ### Keyboard shortcuts (terminal preview)
 
