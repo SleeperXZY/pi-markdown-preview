@@ -64,7 +64,6 @@ pi -e https://github.com/omaclaren/pi-markdown-preview
 | Command | Description |
 |---------|-------------|
 | `/preview` | Preview the latest assistant response in terminal |
-| `/preview-md` | Alias for `/preview` |
 | `/preview --pick` | Select from all assistant responses |
 | `/preview <path/to/file.md>` | Preview a markdown file |
 | `/preview --file <path/to/file.md>` | Preview a file (explicit flag) |

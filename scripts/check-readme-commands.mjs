@@ -29,13 +29,35 @@ const documentedCommands = [
 const registeredSet = new Set(registeredCommands);
 const documentedSet = new Set(documentedCommands);
 
-const missingFromReadme = [...registeredSet].filter((command) => !documentedSet.has(command));
+// Backward-compatible aliases we intentionally keep undocumented.
+const intentionallyUndocumentedCommands = new Set(["preview-md"]);
+
+const staleUndocumentedAllowlist = [...intentionallyUndocumentedCommands].filter(
+	(command) => !registeredSet.has(command),
+);
+if (staleUndocumentedAllowlist.length > 0) {
+	console.error("Undocumented command allowlist contains commands not registered in index.ts:");
+	for (const command of staleUndocumentedAllowlist) {
+		console.error(`  - /${command}`);
+	}
+	process.exit(1);
+}
+
+const missingFromReadme = [...registeredSet].filter(
+	(command) => !documentedSet.has(command) && !intentionallyUndocumentedCommands.has(command),
+);
 const undocumentedInCode = [...documentedSet].filter((command) => !registeredSet.has(command));
 
 if (missingFromReadme.length === 0 && undocumentedInCode.length === 0) {
-	console.log(
-		`README command docs are in sync (${registeredSet.size} commands): ${[...registeredSet].map((c) => `/${c}`).join(", ")}`,
+	const documentedRegisteredCommands = [...registeredSet].filter(
+		(command) => !intentionallyUndocumentedCommands.has(command),
 	);
+	const hiddenAliases = [...intentionallyUndocumentedCommands].filter((command) => registeredSet.has(command));
+	let message = `README command docs are in sync (${documentedRegisteredCommands.length} documented commands): ${documentedRegisteredCommands.map((c) => `/${c}`).join(", ")}`;
+	if (hiddenAliases.length > 0) {
+		message += ` (hidden aliases: ${hiddenAliases.map((c) => `/${c}`).join(", ")})`;
+	}
+	console.log(message);
 	process.exit(0);
 }
 
