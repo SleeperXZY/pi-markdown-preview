@@ -74,6 +74,7 @@ pi -e https://github.com/omaclaren/pi-markdown-preview
 | `/preview --pdf` | Export to PDF and open |
 | `/preview-pdf` | Shortcut for `--pdf` |
 | `/preview --pdf <path/to/file.md>` | Export a file to PDF |
+| `/preview-clear-cache` | Clear rendered preview cache |
 | `/preview --terminal` | Force terminal preview output |
 | `/preview --pick --browser` | Pick a response, open in browser |
 
@@ -136,6 +137,12 @@ export MERMAID_PDF_THEME=default
 ## Cache
 
 Rendered previews are cached at `~/.pi/cache/markdown-preview/`. Clear with:
+
+```bash
+/preview-clear-cache
+```
+
+Or manually:
 
 ```bash
 rm -rf ~/.pi/cache/markdown-preview/

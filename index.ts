@@ -1637,4 +1637,18 @@ export default function (pi: ExtensionAPI) {
 			await run(`--pdf ${args}`.trim(), ctx);
 		},
 	});
+
+	pi.registerCommand("preview-clear-cache", {
+		description: "Clear rendered preview cache (~/.pi/cache/markdown-preview)",
+		handler: async (_args, ctx) => {
+			await ctx.waitForIdle();
+			try {
+				await rm(CACHE_DIR, { recursive: true, force: true });
+				ctx.ui.notify(`Cleared preview cache: ${CACHE_DIR}`, "info");
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				ctx.ui.notify(`Failed to clear preview cache: ${message}`, "error");
+			}
+		},
+	});
 }
