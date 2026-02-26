@@ -26,14 +26,12 @@ Preview adapts to your pi theme. Examples in dark and light:
 - **Terminal preview** — renders markdown as PNG images displayed inline (Kitty, iTerm2, Ghostty, WezTerm). Long responses are automatically split across navigable pages.
 - **Browser preview** — opens rendered HTML in your default browser as a single continuous scrollable document
 - **PDF export** — exports markdown to PDF via pandoc + LaTeX and opens it in your default PDF viewer
-- **Mermaid diagrams** — renders ` ```mermaid` code blocks as SVG diagrams in terminal and browser previews (dark/light theme aware)
+- **Mermaid diagrams** — renders ` ```mermaid` code blocks as SVG diagrams in terminal/browser previews, and as high-quality vector diagrams in PDF export when Mermaid CLI is available
 - **LaTeX/math support** — renders `$inline$` and `$$display$$` math via MathML (browser/terminal) or native LaTeX (PDF)
 - **Theme-aware** — matches your pi theme (dark/light, accent colours)
 - **Response picker** — select any past assistant response to preview, not just the latest
 - **File preview** — preview arbitrary `.md` files from the filesystem
 - **Caching** — rendered pages are cached for instant re-display; refresh (`r`) bypasses cache
-
-> **Note:** Mermaid diagrams are not currently rendered in PDF output (the LaTeX pipeline does not support them). Use `--browser` for full mermaid support.
 
 ## Prerequisites
 
@@ -41,6 +39,7 @@ Preview adapts to your pi theme. Examples in dark and light:
 - [Pandoc](https://pandoc.org/installing.html) (`brew install pandoc` on macOS)
 - A terminal with image support (Ghostty, Kitty, iTerm2, WezTerm) for inline preview
 - A LaTeX engine for PDF export (optional): [TeX Live](https://tug.org/texlive/) (`brew install --cask mactex` on macOS, `apt install texlive` on Linux)
+- Mermaid CLI for Mermaid-in-PDF support (optional): `npm install -g @mermaid-js/mermaid-cli` (requires a Chromium browser accessible to Mermaid CLI)
 
 ## Install
 
@@ -101,6 +100,18 @@ Set `PUPPETEER_EXECUTABLE_PATH` to override browser detection:
 
 ```bash
 export PUPPETEER_EXECUTABLE_PATH=/path/to/chromium
+```
+
+Set `MERMAID_CLI_PATH` if `mmdc` is not on your `PATH`:
+
+```bash
+export MERMAID_CLI_PATH=/path/to/mmdc
+```
+
+Set `MERMAID_PDF_THEME` for PDF Mermaid rendering (`default`, `forest`, `dark`, `neutral`; default: `default`):
+
+```bash
+export MERMAID_PDF_THEME=default
 ```
 
 ## Cache

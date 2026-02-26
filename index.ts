@@ -16,14 +16,15 @@ import {
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { pathToFileURL } from "node:url";
 import puppeteer from "puppeteer-core";
 
 const CACHE_DIR = join(homedir(), ".pi", "cache", "markdown-preview");
-const RENDER_VERSION = "v9";
+const MERMAID_PDF_CACHE_DIR = join(CACHE_DIR, "mermaid-pdf");
+const RENDER_VERSION = "v11";
 const VIEWPORT_WIDTH_PX = 1200;
 const PAGE_HEIGHT_PX = 2200;
 const MAX_RENDER_HEIGHT_PX = 66000; // PAGE_HEIGHT_PX * 30
@@ -1053,6 +1054,178 @@ async function renderMarkdownToPdf(markdown: string, outputPath: string, resourc
 	});
 }
 
+class MermaidCliMissingError extends Error {}
+
+interface MermaidPdfPreprocessResult {
+	markdown: string;
+	found: number;
+	replaced: number;
+	failed: number;
+	missingCli: boolean;
+}
+
+function getMermaidPdfTheme(): "default" | "forest" | "dark" | "neutral" {
+	const requested = process.env.MERMAID_PDF_THEME?.trim().toLowerCase();
+	if (requested === "default" || requested === "forest" || requested === "dark" || requested === "neutral") {
+		return requested;
+	}
+	return "default";
+}
+
+async function renderMermaidDiagramForPdf(source: string, outputPath: string): Promise<void> {
+	const mermaidCommand = process.env.MERMAID_CLI_PATH?.trim() || "mmdc";
+	const mermaidTheme = getMermaidPdfTheme();
+	const tempDir = await mkdtemp(join(tmpdir(), "pi-markdown-preview-mermaid-"));
+	const inputPath = join(tempDir, "diagram.mmd");
+
+	await mkdir(dirname(outputPath), { recursive: true });
+
+	try {
+		await writeFile(inputPath, source, "utf-8");
+		await new Promise<void>((resolve, reject) => {
+			const args = ["-i", inputPath, "-o", outputPath, "-t", mermaidTheme, "-f"];
+			const child = spawn(mermaidCommand, args, { stdio: ["ignore", "ignore", "pipe"] });
+			const stderrChunks: Buffer[] = [];
+			let settled = false;
+
+			const fail = (error: Error) => {
+				if (settled) return;
+				settled = true;
+				reject(error);
+			};
+
+			child.stderr.on("data", (chunk: Buffer | string) => {
+				stderrChunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+			});
+
+			child.once("error", (error) => {
+				const errno = error as NodeJS.ErrnoException;
+				if (errno.code === "ENOENT") {
+					fail(
+						new MermaidCliMissingError(
+							"Mermaid CLI (mmdc) not found. Install with `npm install -g @mermaid-js/mermaid-cli` or set MERMAID_CLI_PATH.",
+						),
+					);
+					return;
+				}
+				fail(error);
+			});
+
+			child.once("close", (code) => {
+				if (settled) return;
+				settled = true;
+				if (code === 0) {
+					resolve();
+					return;
+				}
+				const stderr = Buffer.concat(stderrChunks).toString("utf-8").trim();
+				reject(new Error(`Mermaid CLI failed with exit code ${code}${stderr ? `: ${stderr}` : ""}`));
+			});
+		});
+	} finally {
+		await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+	}
+}
+
+async function preprocessMermaidForPdf(markdown: string): Promise<MermaidPdfPreprocessResult> {
+	const mermaidRegex = /```mermaid[^\n]*\n([\s\S]*?)```/gi;
+	const matches: Array<{ start: number; end: number; raw: string; source: string; number: number }> = [];
+	let match: RegExpExecArray | null;
+	let blockNumber = 1;
+
+	while ((match = mermaidRegex.exec(markdown)) !== null) {
+		const raw = match[0]!;
+		const source = (match[1] ?? "").trimEnd();
+		matches.push({
+			start: match.index,
+			end: match.index + raw.length,
+			raw,
+			source,
+			number: blockNumber++,
+		});
+	}
+
+	if (matches.length === 0) {
+		return {
+			markdown,
+			found: 0,
+			replaced: 0,
+			failed: 0,
+			missingCli: false,
+		};
+	}
+
+	await mkdir(MERMAID_PDF_CACHE_DIR, { recursive: true });
+
+	const renderedBySource = new Map<string, string | null>();
+	let missingCli = false;
+	const mermaidTheme = getMermaidPdfTheme();
+
+	for (const block of matches) {
+		if (renderedBySource.has(block.source)) continue;
+
+		const hash = createHash("sha256")
+			.update(RENDER_VERSION)
+			.update("\u0000")
+			.update("pdf-mermaid")
+			.update("\u0000")
+			.update(mermaidTheme)
+			.update("\u0000")
+			.update(block.source)
+			.digest("hex");
+		const outputPath = join(MERMAID_PDF_CACHE_DIR, `${hash}.pdf`);
+
+		if (existsSync(outputPath)) {
+			renderedBySource.set(block.source, outputPath);
+			continue;
+		}
+
+		if (missingCli) {
+			renderedBySource.set(block.source, null);
+			continue;
+		}
+
+		try {
+			await renderMermaidDiagramForPdf(block.source, outputPath);
+			renderedBySource.set(block.source, outputPath);
+		} catch (error) {
+			if (error instanceof MermaidCliMissingError) {
+				missingCli = true;
+			}
+			renderedBySource.set(block.source, null);
+		}
+	}
+
+	let transformed = "";
+	let cursor = 0;
+	let replaced = 0;
+	let failed = 0;
+
+	for (const block of matches) {
+		transformed += markdown.slice(cursor, block.start);
+		const renderedPath = renderedBySource.get(block.source) ?? null;
+		if (renderedPath) {
+			replaced++;
+			const imageRef = pathToFileURL(renderedPath).href;
+			transformed += `\n![Mermaid diagram ${block.number}](<${imageRef}>)\n`;
+		} else {
+			failed++;
+			transformed += block.raw;
+		}
+		cursor = block.end;
+	}
+
+	transformed += markdown.slice(cursor);
+
+	return {
+		markdown: transformed,
+		found: matches.length,
+		replaced,
+		failed,
+		missingCli,
+	};
+}
+
 async function exportPdf(ctx: ExtensionCommandContext, markdownOverride?: string, resourcePath?: string): Promise<void> {
 	const markdown = markdownOverride ?? getLastAssistantMarkdown(ctx);
 	if (!markdown) {
@@ -1060,22 +1233,33 @@ async function exportPdf(ctx: ExtensionCommandContext, markdownOverride?: string
 		return;
 	}
 
-	if (/```mermaid\b/i.test(markdown)) {
-		ctx.ui.notify("Mermaid diagrams are not rendered in PDF output. Use --browser for full mermaid support.", "warning");
+	const normalizedMarkdown = normalizeObsidianImages(normalizeMathDelimiters(markdown));
+	const mermaidPrepared = await preprocessMermaidForPdf(normalizedMarkdown);
+
+	if (mermaidPrepared.missingCli) {
+		ctx.ui.notify(
+			"Mermaid CLI (mmdc) not found; Mermaid blocks are kept as code in PDF. Install @mermaid-js/mermaid-cli or set MERMAID_CLI_PATH.",
+			"warning",
+		);
+	} else if (mermaidPrepared.failed > 0) {
+		ctx.ui.notify(
+			`Failed to render ${mermaidPrepared.failed} Mermaid block${mermaidPrepared.failed === 1 ? "" : "s"} for PDF. Unrendered blocks are kept as code.`,
+			"warning",
+		);
 	}
 
-	const normalizedMarkdown = normalizeObsidianImages(normalizeMathDelimiters(markdown));
+	const markdownForPdf = mermaidPrepared.markdown;
 	const hash = createHash("sha256")
 		.update(RENDER_VERSION)
 		.update("\u0000")
 		.update("pdf")
 		.update("\u0000")
-		.update(normalizedMarkdown)
+		.update(markdownForPdf)
 		.digest("hex");
 	const pdfPath = join(CACHE_DIR, `${hash}.pdf`);
 
 	await mkdir(CACHE_DIR, { recursive: true });
-	await renderMarkdownToPdf(normalizedMarkdown, pdfPath, resourcePath);
+	await renderMarkdownToPdf(markdownForPdf, pdfPath, resourcePath);
 	await openFileInDefaultBrowser(pdfPath);
 }
 
