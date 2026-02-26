@@ -1,6 +1,6 @@
 {
   "name": "pi-markdown-preview",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Rendered markdown + LaTeX preview for pi, with terminal, browser, and PDF output",
   "type": "module",
   "license": "MIT",
@@ -9,7 +9,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/omaclaren/pi-markdown-preview"
+    "url": "git+https://github.com/omaclaren/pi-markdown-preview.git"
   },
   "pi": {
     "extensions": [
