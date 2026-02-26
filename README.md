@@ -66,14 +66,14 @@ pi -e https://github.com/omaclaren/pi-markdown-preview
 | `/preview` | Preview the latest assistant response in terminal |
 | `/preview-md` | Alias for `/preview` |
 | `/preview --pick` | Select from all assistant responses |
-| `/preview README.md` | Preview a markdown file |
-| `/preview --file ./docs/guide.md` | Preview a file (explicit flag) |
+| `/preview <path/to/file.md>` | Preview a markdown file |
+| `/preview --file <path/to/file.md>` | Preview a file (explicit flag) |
 | `/preview --browser` | Open preview in default browser |
 | `/preview-browser` | Shortcut for browser preview |
-| `/preview-browser README.md` | Open a file preview in browser |
+| `/preview-browser <path/to/file.md>` | Open a file preview in browser |
 | `/preview --pdf` | Export to PDF and open |
 | `/preview-pdf` | Shortcut for `--pdf` |
-| `/preview --pdf README.md` | Export a file to PDF |
+| `/preview --pdf <path/to/file.md>` | Export a file to PDF |
 | `/preview --terminal` | Force terminal preview output |
 | `/preview --pick --browser` | Pick a response, open in browser |
 
