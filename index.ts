@@ -1616,11 +1616,6 @@ export default function (pi: ExtensionAPI) {
 		handler: run,
 	});
 
-	pi.registerCommand("preview-md", {
-		description: "Alias for /preview",
-		handler: run,
-	});
-
 	pi.registerCommand("preview-browser", {
 		description: "Open rendered markdown + LaTeX preview in the default browser (native MathML via pandoc)",
 		handler: async (args, ctx) => {

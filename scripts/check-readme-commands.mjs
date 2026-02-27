@@ -30,7 +30,7 @@ const registeredSet = new Set(registeredCommands);
 const documentedSet = new Set(documentedCommands);
 
 // Backward-compatible aliases we intentionally keep undocumented.
-const intentionallyUndocumentedCommands = new Set(["preview-md"]);
+const intentionallyUndocumentedCommands = new Set();
 
 const staleUndocumentedAllowlist = [...intentionallyUndocumentedCommands].filter(
 	(command) => !registeredSet.has(command),
