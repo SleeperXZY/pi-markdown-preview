@@ -27,7 +27,7 @@ Preview adapts to your pi theme. Examples in dark and light:
 - **Browser preview** — opens rendered HTML in your default browser as a single continuous scrollable document
 - **PDF export** — exports markdown to PDF via pandoc + LaTeX and opens it in your default PDF viewer
 - **Mermaid diagrams** — renders ` ```mermaid` code blocks as SVG diagrams in terminal/browser previews, and as high-quality vector diagrams in PDF export when Mermaid CLI is available
-- **LaTeX/math support** — renders `$inline$` and `$$display$$` math via MathML (browser/terminal) or native LaTeX (PDF)
+- **LaTeX/math support** — renders `$inline$`, `$$display$$`, `\(...\)`, and `\[...\]` math via MathML (browser/terminal) or native LaTeX (PDF)
 - **Theme-aware** — matches your pi theme (dark/light, accent colours)
 - **Response picker** — select any past assistant response to preview, not just the latest
 - **File preview** — preview arbitrary `.md` files from the filesystem
@@ -35,11 +35,11 @@ Preview adapts to your pi theme. Examples in dark and light:
 
 ## Prerequisites
 
-- A Chromium-based browser (Chrome, Brave, Edge, Chromium)
 - [Pandoc](https://pandoc.org/installing.html) (`brew install pandoc` on macOS)
-- A terminal with image support (Ghostty, Kitty, iTerm2, WezTerm) for inline preview
-- A LaTeX engine for PDF export (optional): [TeX Live](https://tug.org/texlive/) (`brew install --cask mactex` on macOS, `apt install texlive` on Linux)
-- Mermaid CLI for Mermaid-in-PDF support (optional): `npm install -g @mermaid-js/mermaid-cli` (requires a Chromium browser accessible to Mermaid CLI)
+- For terminal preview (`/preview` default): a Chromium-based browser (Chrome, Brave, Edge, Chromium), because terminal rendering uses `puppeteer-core`
+- For terminal inline display: a terminal with image support (Ghostty, Kitty, iTerm2, WezTerm)
+- For PDF export (optional): a LaTeX engine, e.g. [TeX Live](https://tug.org/texlive/) (`brew install --cask mactex` on macOS, `apt install texlive` on Linux)
+- For Mermaid-in-PDF support (optional): Mermaid CLI (`npm install -g @mermaid-js/mermaid-cli`) and a Chromium browser accessible to Mermaid CLI
 
 ## Install
 
@@ -74,7 +74,6 @@ pi -e https://github.com/omaclaren/pi-markdown-preview
 | `/preview-pdf` | Shortcut for `--pdf` |
 | `/preview --pdf <path/to/file.md>` | Export a file to PDF |
 | `/preview-clear-cache` | Clear rendered preview cache |
-| `/preview --terminal` | Force terminal preview output |
 | `/preview --pick --browser` | Pick a response, open in browser |
 
 Additional accepted argument aliases:
@@ -82,7 +81,7 @@ Additional accepted argument aliases:
 - File: `-f`
 - Browser target: `browser`, `--external`, `external`, `--browser-native`, `native`
 - PDF target: `pdf`
-- Terminal target: `terminal`
+- Terminal target: `terminal`, `--terminal` (usually unnecessary because terminal is the default)
 - Help: `--help`, `-h`, `help`
 - Note: `--pick` and `--file` cannot be used together
 
@@ -115,7 +114,7 @@ Set `PANDOC_PDF_ENGINE` to override the LaTeX engine used for PDF export (defaul
 export PANDOC_PDF_ENGINE=xelatex
 ```
 
-Set `PUPPETEER_EXECUTABLE_PATH` to override browser detection:
+Set `PUPPETEER_EXECUTABLE_PATH` to override Chromium detection for terminal preview rendering:
 
 ```bash
 export PUPPETEER_EXECUTABLE_PATH=/path/to/chromium
