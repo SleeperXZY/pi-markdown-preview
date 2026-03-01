@@ -24,7 +24,7 @@ import puppeteer from "puppeteer-core";
 
 const CACHE_DIR = join(homedir(), ".pi", "cache", "markdown-preview");
 const MERMAID_PDF_CACHE_DIR = join(CACHE_DIR, "mermaid-pdf");
-const RENDER_VERSION = "v11";
+const RENDER_VERSION = "v12";
 const VIEWPORT_WIDTH_PX = 1200;
 const PAGE_HEIGHT_PX = 2200;
 const MAX_RENDER_HEIGHT_PX = 66000; // PAGE_HEIGHT_PX * 30
@@ -245,13 +245,34 @@ function getLastAssistantMarkdown(ctx: ExtensionCommandContext): string | undefi
 	return messages.length > 0 ? messages[messages.length - 1]!.markdown : undefined;
 }
 
+function isLikelyMathExpression(expr: string): boolean {
+	const content = expr.trim();
+	if (content.length === 0) return false;
+
+	if (/\\[a-zA-Z]+/.test(content)) return true; // LaTeX commands like \frac, \alpha
+	if (/[0-9]/.test(content)) return true;
+	if (/[=+\-*/^_<>≤≥±×÷]/u.test(content)) return true;
+	if (/[{}]/.test(content)) return true;
+	if (/[α-ωΑ-Ω]/u.test(content)) return true;
+	if (/^[A-Za-z]$/.test(content)) return true; // single-variable forms like \(x\)
+
+	// Plain words (e.g. escaped markdown like \[not a link\]) are not math.
+	if (/^[A-Za-z][A-Za-z\s'".,:;!?-]*[A-Za-z]$/.test(content)) return false;
+
+	return false;
+}
+
 function normalizeMathDelimitersInSegment(markdown: string): string {
-	let normalized = markdown.replace(/\\\[\s*([\s\S]*?)\s*\\\]/g, (_match, expr: string) => {
+	let normalized = markdown.replace(/\\\[\s*([\s\S]*?)\s*\\\]/g, (match, expr: string) => {
 		const content = expr.trim();
+		if (!isLikelyMathExpression(content)) return match;
 		return content.length > 0 ? `$$\n${content}\n$$` : "$$\n$$";
 	});
 
-	normalized = normalized.replace(/\\\(([\s\S]*?)\\\)/g, (_match, expr: string) => `$${expr}$`);
+	normalized = normalized.replace(/\\\(([\s\S]*?)\\\)/g, (match, expr: string) => {
+		if (!isLikelyMathExpression(expr)) return match;
+		return `$${expr}$`;
+	});
 	return normalized;
 }
 
@@ -266,6 +287,65 @@ function normalizeMathDelimiters(markdown: string): string {
 	const flushPlain = () => {
 		if (plainBuffer.length === 0) return;
 		out.push(normalizeMathDelimitersInSegment(plainBuffer.join("\n")));
+		plainBuffer = [];
+	};
+
+	for (const line of lines) {
+		const trimmed = line.trimStart();
+		const fenceMatch = trimmed.match(/^(`{3,}|~{3,})/);
+
+		if (fenceMatch) {
+			const marker = fenceMatch[1]!;
+			const markerChar = marker[0] as "`" | "~";
+			const markerLength = marker.length;
+
+			if (!inFence) {
+				flushPlain();
+				inFence = true;
+				fenceChar = markerChar;
+				fenceLength = markerLength;
+				out.push(line);
+				continue;
+			}
+
+			if (fenceChar === markerChar && markerLength >= fenceLength) {
+				inFence = false;
+				fenceChar = undefined;
+				fenceLength = 0;
+			}
+
+			out.push(line);
+			continue;
+		}
+
+		if (inFence) {
+			out.push(line);
+		} else {
+			plainBuffer.push(line);
+		}
+	}
+
+	flushPlain();
+	return out.join("\n");
+}
+
+function normalizeSubSupTagsInSegment(markdown: string): string {
+	let normalized = markdown.replace(/<sub>([^<\n]+)<\/sub>/gi, (_match, content: string) => `~${content}~`);
+	normalized = normalized.replace(/<sup>([^<\n]+)<\/sup>/gi, (_match, content: string) => `^${content}^`);
+	return normalized;
+}
+
+function normalizeSubSupTags(markdown: string): string {
+	const lines = markdown.split("\n");
+	const out: string[] = [];
+	let plainBuffer: string[] = [];
+	let inFence = false;
+	let fenceChar: "`" | "~" | undefined;
+	let fenceLength = 0;
+
+	const flushPlain = () => {
+		if (plainBuffer.length === 0) return;
+		out.push(normalizeSubSupTagsInSegment(plainBuffer.join("\n")));
 		plainBuffer = [];
 	};
 
@@ -917,7 +997,7 @@ async function openFileInDefaultBrowser(filePath: string): Promise<void> {
 
 async function renderMarkdownToHtmlWithPandoc(markdown: string, resourcePath?: string): Promise<string> {
 	const pandocCommand = process.env.PANDOC_PATH?.trim() || "pandoc";
-	const args = ["-f", "gfm+tex_math_dollars", "-t", "html5", "--mathml", "--no-highlight"];
+	const args = ["-f", "gfm+tex_math_dollars", "-t", "html5", "--mathml"];
 	if (resourcePath) args.push(`--resource-path=${resourcePath}`);
 
 	return await new Promise<string>((resolve, reject) => {
@@ -996,7 +1076,7 @@ async function renderMarkdownToPdf(markdown: string, outputPath: string, resourc
 	const pdfEngine = process.env.PANDOC_PDF_ENGINE?.trim() || "xelatex";
 	const preamblePath = await ensurePdfPreamble();
 	const args = [
-		"-f", "gfm+tex_math_dollars",
+		"-f", "gfm+tex_math_dollars+superscript+subscript",
 		"-o", outputPath,
 		`--pdf-engine=${pdfEngine}`,
 		"-V", "geometry:margin=2.2cm",
@@ -1233,7 +1313,7 @@ async function exportPdf(ctx: ExtensionCommandContext, markdownOverride?: string
 		return;
 	}
 
-	const normalizedMarkdown = normalizeObsidianImages(normalizeMathDelimiters(markdown));
+	const normalizedMarkdown = normalizeSubSupTags(normalizeObsidianImages(normalizeMathDelimiters(markdown)));
 	const mermaidPrepared = await preprocessMermaidForPdf(normalizedMarkdown);
 
 	if (mermaidPrepared.missingCli) {
@@ -1281,6 +1361,10 @@ function buildBrowserHtmlFromPandocFragment(fragmentHtml: string, style: Preview
   --muted: ${palette.muted};
   --code-bg: ${palette.codeBg};
   --link: ${palette.link};
+  --syntax-keyword: ${palette.link};
+  --syntax-string: ${style.themeMode === "dark" ? "#7ee787" : "#116329"};
+  --syntax-number: ${style.themeMode === "dark" ? "#e3b341" : "#9a6700"};
+  --syntax-error: ${style.themeMode === "dark" ? "#ff7b72" : "#cf222e"};
 }
 * { box-sizing: border-box; }
 html, body {
@@ -1340,6 +1424,42 @@ body {
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 0.12em 0.35em;
+}
+#preview-root code span.kw,
+#preview-root code span.cf,
+#preview-root code span.im,
+#preview-root code span.dt {
+  color: var(--syntax-keyword);
+  font-weight: 600;
+}
+#preview-root code span.fu,
+#preview-root code span.bu,
+#preview-root code span.va,
+#preview-root code span.ot {
+  color: var(--syntax-keyword);
+}
+#preview-root code span.st,
+#preview-root code span.ss,
+#preview-root code span.sc,
+#preview-root code span.ch {
+  color: var(--syntax-string);
+}
+#preview-root code span.dv,
+#preview-root code span.bn,
+#preview-root code span.fl {
+  color: var(--syntax-number);
+}
+#preview-root code span.co {
+  color: var(--muted);
+  font-style: italic;
+}
+#preview-root code span.op {
+  color: var(--text);
+}
+#preview-root code span.er,
+#preview-root code span.al {
+  color: var(--syntax-error);
+  font-weight: 600;
 }
 #preview-root table {
   border-collapse: collapse;
