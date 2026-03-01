@@ -24,7 +24,7 @@ import puppeteer from "puppeteer-core";
 
 const CACHE_DIR = join(homedir(), ".pi", "cache", "markdown-preview");
 const MERMAID_PDF_CACHE_DIR = join(CACHE_DIR, "mermaid-pdf");
-const RENDER_VERSION = "v11";
+const RENDER_VERSION = "v12";
 const VIEWPORT_WIDTH_PX = 1200;
 const PAGE_HEIGHT_PX = 2200;
 const MAX_RENDER_HEIGHT_PX = 66000; // PAGE_HEIGHT_PX * 30
@@ -917,7 +917,7 @@ async function openFileInDefaultBrowser(filePath: string): Promise<void> {
 
 async function renderMarkdownToHtmlWithPandoc(markdown: string, resourcePath?: string): Promise<string> {
 	const pandocCommand = process.env.PANDOC_PATH?.trim() || "pandoc";
-	const args = ["-f", "gfm+tex_math_dollars", "-t", "html5", "--mathml", "--no-highlight"];
+	const args = ["-f", "gfm+tex_math_dollars", "-t", "html5", "--mathml"];
 	if (resourcePath) args.push(`--resource-path=${resourcePath}`);
 
 	return await new Promise<string>((resolve, reject) => {
@@ -1281,6 +1281,10 @@ function buildBrowserHtmlFromPandocFragment(fragmentHtml: string, style: Preview
   --muted: ${palette.muted};
   --code-bg: ${palette.codeBg};
   --link: ${palette.link};
+  --syntax-keyword: ${palette.link};
+  --syntax-string: ${style.themeMode === "dark" ? "#7ee787" : "#116329"};
+  --syntax-number: ${style.themeMode === "dark" ? "#e3b341" : "#9a6700"};
+  --syntax-error: ${style.themeMode === "dark" ? "#ff7b72" : "#cf222e"};
 }
 * { box-sizing: border-box; }
 html, body {
@@ -1340,6 +1344,42 @@ body {
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 0.12em 0.35em;
+}
+#preview-root code span.kw,
+#preview-root code span.cf,
+#preview-root code span.im,
+#preview-root code span.dt {
+  color: var(--syntax-keyword);
+  font-weight: 600;
+}
+#preview-root code span.fu,
+#preview-root code span.bu,
+#preview-root code span.va,
+#preview-root code span.ot {
+  color: var(--syntax-keyword);
+}
+#preview-root code span.st,
+#preview-root code span.ss,
+#preview-root code span.sc,
+#preview-root code span.ch {
+  color: var(--syntax-string);
+}
+#preview-root code span.dv,
+#preview-root code span.bn,
+#preview-root code span.fl {
+  color: var(--syntax-number);
+}
+#preview-root code span.co {
+  color: var(--muted);
+  font-style: italic;
+}
+#preview-root code span.op {
+  color: var(--text);
+}
+#preview-root code span.er,
+#preview-root code span.al {
+  color: var(--syntax-error);
+  font-weight: 600;
 }
 #preview-root table {
   border-collapse: collapse;

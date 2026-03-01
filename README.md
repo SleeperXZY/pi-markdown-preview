@@ -23,7 +23,7 @@ Preview adapts to your pi theme. Examples in dark and light:
 
 ## Features
 
-- **Terminal preview** — renders markdown as PNG images displayed inline (Kitty, iTerm2, Ghostty, WezTerm). Long responses are automatically split across navigable pages.
+- **Terminal preview (default)** — renders markdown as PNG images displayed inline (Kitty, iTerm2, Ghostty, WezTerm). Long responses are automatically split across navigable pages.
 - **Browser preview** — opens rendered HTML in your default browser as a single continuous scrollable document
 - **PDF export** — exports markdown to PDF via pandoc + LaTeX and opens it in your default PDF viewer
 - **Mermaid diagrams** — renders ` ```mermaid` code blocks as SVG diagrams in terminal/browser previews, and as high-quality vector diagrams in PDF export when Mermaid CLI is available
