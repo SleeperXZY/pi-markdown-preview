@@ -36,7 +36,7 @@ Preview adapts to your pi theme. Examples in dark and light:
 ## Prerequisites
 
 - [Pandoc](https://pandoc.org/installing.html) (`brew install pandoc` on macOS)
-- For terminal preview (`/preview` default): a Chromium-based browser (Chrome, Brave, Edge, Chromium), because terminal rendering uses `puppeteer-core`
+- For terminal preview (`/preview` default): a Chromium-based browser executable (Chrome, Brave, Edge, Chromium). `puppeteer-core` is included as an extension dependency; no separate Puppeteer install is needed.
 - For terminal inline display: a terminal with image support (Ghostty, Kitty, iTerm2, WezTerm)
 - For PDF export (optional): a LaTeX engine, e.g. [TeX Live](https://tug.org/texlive/) (`brew install --cask mactex` on macOS, `apt install texlive` on Linux)
 - For Mermaid-in-PDF support (optional): Mermaid CLI (`npm install -g @mermaid-js/mermaid-cli`) and a Chromium browser accessible to Mermaid CLI
