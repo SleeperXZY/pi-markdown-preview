@@ -18,7 +18,7 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join, resolve as resolvePath } from "node:path";
+import { basename, dirname, extname, join, resolve as resolvePath } from "node:path";
 import { pathToFileURL } from "node:url";
 import puppeteer from "puppeteer-core";
 
@@ -40,6 +40,15 @@ interface PreviewPalette {
 	muted: string;
 	codeBg: string;
 	link: string;
+	syntaxComment: string;
+	syntaxKeyword: string;
+	syntaxFunction: string;
+	syntaxVariable: string;
+	syntaxString: string;
+	syntaxNumber: string;
+	syntaxType: string;
+	syntaxOperator: string;
+	syntaxPunctuation: string;
 }
 
 interface PreviewStyle {
@@ -78,8 +87,17 @@ const DARK_PREVIEW_PALETTE: PreviewPalette = {
 	border: "#2b3343",
 	text: "#e6edf3",
 	muted: "#9da7b5",
-	codeBg: "#111826",
+	codeBg: "#13171e",
 	link: "#58a6ff",
+	syntaxComment: "#6A9955",
+	syntaxKeyword: "#569CD6",
+	syntaxFunction: "#DCDCAA",
+	syntaxVariable: "#9CDCFE",
+	syntaxString: "#CE9178",
+	syntaxNumber: "#B5CEA8",
+	syntaxType: "#4EC9B0",
+	syntaxOperator: "#D4D4D4",
+	syntaxPunctuation: "#D4D4D4",
 };
 
 const LIGHT_PREVIEW_PALETTE: PreviewPalette = {
@@ -88,8 +106,17 @@ const LIGHT_PREVIEW_PALETTE: PreviewPalette = {
 	border: "#d0d7de",
 	text: "#1f2328",
 	muted: "#57606a",
-	codeBg: "#f6f8fa",
+	codeBg: "#f7f7f7",
 	link: "#0969da",
+	syntaxComment: "#008000",
+	syntaxKeyword: "#0000FF",
+	syntaxFunction: "#795E26",
+	syntaxVariable: "#001080",
+	syntaxString: "#A31515",
+	syntaxNumber: "#098658",
+	syntaxType: "#267F99",
+	syntaxOperator: "#000000",
+	syntaxPunctuation: "#000000",
 };
 
 function getThemeMode(theme?: Theme): ThemeMode {
@@ -104,6 +131,25 @@ function toHexByte(value: number): string {
 
 function rgbToHex(r: number, g: number, b: number): string {
 	return `#${toHexByte(r)}${toHexByte(g)}${toHexByte(b)}`;
+}
+
+function hexToRgb(hex: string): { r: number; g: number; b: number } | undefined {
+	const m = hex.replace("#", "").match(/^([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i);
+	if (!m) return undefined;
+	return { r: parseInt(m[1]!, 16), g: parseInt(m[2]!, 16), b: parseInt(m[3]!, 16) };
+}
+
+function adjustCodeBg(cardHex: string, themeMode: ThemeMode): string {
+	const rgb = hexToRgb(cardHex);
+	if (!rgb) return cardHex;
+	if (themeMode === "dark") {
+		// Slightly darker than card
+		const f = 0.85;
+		return rgbToHex(Math.round(rgb.r * f), Math.round(rgb.g * f), Math.round(rgb.b * f));
+	}
+	// Light: slightly darker than card (towards gray)
+	const f = 0.97;
+	return rgbToHex(Math.round(rgb.r * f), Math.round(rgb.g * f), Math.round(rgb.b * f));
 }
 
 function xterm256ToHex(index: number): string {
@@ -181,15 +227,26 @@ function getPreviewStyle(theme?: Theme): PreviewStyle {
 		};
 	}
 
+	const card = safeThemeColor(() => theme.getBgAnsi("toolPendingBg")) ?? fallback.card;
+
 	const palette: PreviewPalette = {
 		bg: safeThemeColor(() => theme.getBgAnsi("customMessageBg")) ?? fallback.bg,
-		card: safeThemeColor(() => theme.getBgAnsi("toolPendingBg")) ?? fallback.card,
+		card,
 		border: safeThemeColor(() => theme.getFgAnsi("border")) ?? fallback.border,
 		text: safeThemeColor(() => theme.getFgAnsi("text")) ?? fallback.text,
 		muted: safeThemeColor(() => theme.getFgAnsi("muted")) ?? fallback.muted,
-		codeBg: safeThemeColor(() => theme.getBgAnsi("selectedBg")) ?? fallback.codeBg,
+		codeBg: adjustCodeBg(card, themeMode),
 		link:
 			safeThemeColor(() => theme.getFgAnsi("mdLink")) ?? safeThemeColor(() => theme.getFgAnsi("accent")) ?? fallback.link,
+		syntaxComment: safeThemeColor(() => theme.getFgAnsi("syntaxComment")) ?? fallback.syntaxComment,
+		syntaxKeyword: safeThemeColor(() => theme.getFgAnsi("syntaxKeyword")) ?? fallback.syntaxKeyword,
+		syntaxFunction: safeThemeColor(() => theme.getFgAnsi("syntaxFunction")) ?? fallback.syntaxFunction,
+		syntaxVariable: safeThemeColor(() => theme.getFgAnsi("syntaxVariable")) ?? fallback.syntaxVariable,
+		syntaxString: safeThemeColor(() => theme.getFgAnsi("syntaxString")) ?? fallback.syntaxString,
+		syntaxNumber: safeThemeColor(() => theme.getFgAnsi("syntaxNumber")) ?? fallback.syntaxNumber,
+		syntaxType: safeThemeColor(() => theme.getFgAnsi("syntaxType")) ?? fallback.syntaxType,
+		syntaxOperator: safeThemeColor(() => theme.getFgAnsi("syntaxOperator")) ?? fallback.syntaxOperator,
+		syntaxPunctuation: safeThemeColor(() => theme.getFgAnsi("syntaxPunctuation")) ?? fallback.syntaxPunctuation,
 	};
 
 	const cacheKey = [
@@ -201,6 +258,15 @@ function getPreviewStyle(theme?: Theme): PreviewStyle {
 		palette.muted,
 		palette.codeBg,
 		palette.link,
+		palette.syntaxComment,
+		palette.syntaxKeyword,
+		palette.syntaxFunction,
+		palette.syntaxVariable,
+		palette.syntaxString,
+		palette.syntaxNumber,
+		palette.syntaxType,
+		palette.syntaxOperator,
+		palette.syntaxPunctuation,
 	].join("|");
 
 	return {
@@ -393,6 +459,70 @@ function normalizeObsidianImages(markdown: string): string {
 	return markdown
 		.replace(/!\[\[([^|\]]+)\|([^\]]+)\]\]/g, "![$2]($1)")
 		.replace(/!\[\[([^\]]+)\]\]/g, "![]($1)");
+}
+
+const MARKDOWN_EXTENSIONS = new Set(["md", "markdown", "mdx", "rmd"]);
+
+const EXT_TO_LANG: Record<string, string> = {
+	ts: "typescript", tsx: "typescript", mts: "typescript", cts: "typescript",
+	js: "javascript", jsx: "javascript", mjs: "javascript", cjs: "javascript",
+	py: "python", pyw: "python",
+	rb: "ruby",
+	rs: "rust",
+	go: "go",
+	java: "java",
+	kt: "kotlin", kts: "kotlin",
+	swift: "swift",
+	c: "c", h: "c",
+	cpp: "cpp", cxx: "cpp", cc: "cpp", hpp: "cpp", hxx: "cpp",
+	cs: "csharp",
+	php: "php",
+	sh: "bash", bash: "bash", zsh: "bash",
+	fish: "fish",
+	ps1: "powershell",
+	sql: "sql",
+	html: "html", htm: "html",
+	css: "css", scss: "scss", sass: "sass", less: "less",
+	json: "json", jsonc: "json", json5: "json",
+	yaml: "yaml", yml: "yaml",
+	toml: "toml",
+	xml: "xml",
+	dockerfile: "dockerfile",
+	makefile: "makefile",
+	cmake: "cmake",
+	lua: "lua",
+	perl: "perl", pl: "perl",
+	r: "r", R: "r",
+	jl: "julia",
+	scala: "scala",
+	clj: "clojure",
+	ex: "elixir", exs: "elixir",
+	erl: "erlang",
+	hs: "haskell",
+	ml: "ocaml",
+	vim: "vim",
+	graphql: "graphql",
+	proto: "protobuf",
+	tf: "hcl", hcl: "hcl",
+	tex: "latex", latex: "latex",
+	f90: "fortran", f95: "fortran", f03: "fortran", f: "fortran", for: "fortran",
+	m: "matlab",
+};
+
+function detectLanguageFromPath(filePath: string): string | undefined {
+	const ext = extname(filePath).replace(/^\./, "").toLowerCase();
+	return EXT_TO_LANG[ext];
+}
+
+function isMarkdownFile(filePath: string): boolean {
+	const ext = extname(filePath).replace(/^\./, "").toLowerCase();
+	return MARKDOWN_EXTENSIONS.has(ext);
+}
+
+function wrapCodeAsMarkdown(code: string, lang?: string, filePath?: string): string {
+	const header = filePath ? `# ${basename(filePath)}\n\n` : "";
+	const fence = lang ? `\`\`\`${lang}` : "```";
+	return `${header}${fence}\n${code}\n\`\`\``;
 }
 
 function getBrowserCandidates(): string[] {
@@ -1361,9 +1491,15 @@ function buildBrowserHtmlFromPandocFragment(fragmentHtml: string, style: Preview
   --muted: ${palette.muted};
   --code-bg: ${palette.codeBg};
   --link: ${palette.link};
-  --syntax-keyword: ${palette.link};
-  --syntax-string: ${style.themeMode === "dark" ? "#7ee787" : "#116329"};
-  --syntax-number: ${style.themeMode === "dark" ? "#e3b341" : "#9a6700"};
+  --syntax-keyword: ${palette.syntaxKeyword};
+  --syntax-function: ${palette.syntaxFunction};
+  --syntax-variable: ${palette.syntaxVariable};
+  --syntax-string: ${palette.syntaxString};
+  --syntax-number: ${palette.syntaxNumber};
+  --syntax-type: ${palette.syntaxType};
+  --syntax-comment: ${palette.syntaxComment};
+  --syntax-operator: ${palette.syntaxOperator};
+  --syntax-punctuation: ${palette.syntaxPunctuation};
   --syntax-error: ${style.themeMode === "dark" ? "#ff7b72" : "#cf222e"};
 }
 * { box-sizing: border-box; }
@@ -1427,16 +1563,21 @@ body {
 }
 #preview-root code span.kw,
 #preview-root code span.cf,
-#preview-root code span.im,
-#preview-root code span.dt {
+#preview-root code span.im {
   color: var(--syntax-keyword);
   font-weight: 600;
 }
+#preview-root code span.dt {
+  color: var(--syntax-type);
+  font-weight: 600;
+}
 #preview-root code span.fu,
-#preview-root code span.bu,
+#preview-root code span.bu {
+  color: var(--syntax-function);
+}
 #preview-root code span.va,
 #preview-root code span.ot {
-  color: var(--syntax-keyword);
+  color: var(--syntax-variable);
 }
 #preview-root code span.st,
 #preview-root code span.ss,
@@ -1450,11 +1591,11 @@ body {
   color: var(--syntax-number);
 }
 #preview-root code span.co {
-  color: var(--muted);
+  color: var(--syntax-comment);
   font-style: italic;
 }
 #preview-root code span.op {
-  color: var(--text);
+  color: var(--syntax-operator);
 }
 #preview-root code span.er,
 #preview-root code span.al {
@@ -1693,8 +1834,14 @@ export default function (pi: ExtensionAPI) {
 					: parsed.file === "~" ? homedir()
 					: parsed.file;
 				const filePath = resolvePath(expanded);
-				markdown = await readFile(filePath, "utf-8");
+				const fileContent = await readFile(filePath, "utf-8");
 				resourcePath = dirname(filePath);
+				if (isMarkdownFile(filePath)) {
+					markdown = fileContent;
+				} else {
+					const lang = detectLanguageFromPath(filePath);
+					markdown = wrapCodeAsMarkdown(fileContent, lang, filePath);
+				}
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				ctx.ui.notify(`Failed to read file: ${message}`, "error");

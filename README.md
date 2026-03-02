@@ -4,17 +4,21 @@ Rendered markdown and LaTeX preview for [pi](https://github.com/badlogic/pi-mono
 
 ## Screenshots
 
-Preview adapts to your pi theme. Examples in dark and light:
+Preview adapts to your pi theme. Examples with a custom theme and the built-in defaults:
 
-**Terminal preview (dark):**
+**Terminal preview (custom theme):**
+
+![Custom theme terminal preview](screenshots/custom-terminal.png)
+
+**Terminal preview (default dark):**
 
 ![Dark terminal preview](screenshots/dark-terminal.png)
 
-**Terminal preview (light):**
+**Terminal preview (default light):**
 
 ![Light terminal preview](screenshots/light-terminal.png)
 
-**Browser preview:**
+**Browser preview (default dark and light):**
 
 <p float="left">
   <img src="screenshots/dark-browser.png" width="49%" />
@@ -28,9 +32,10 @@ Preview adapts to your pi theme. Examples in dark and light:
 - **PDF export** — exports markdown to PDF via pandoc + LaTeX and opens it in your default PDF viewer
 - **Mermaid diagrams** — renders ` ```mermaid` code blocks as SVG diagrams in terminal/browser previews, and as high-quality vector diagrams in PDF export when Mermaid CLI is available
 - **LaTeX/math support** — renders `$inline$`, `$$display$$`, `\(...\)`, and `\[...\]` math via MathML (browser/terminal) or native LaTeX (PDF)
-- **Theme-aware** — matches your pi theme (dark/light, accent colours)
+- **Syntax highlighting** — fenced code blocks in markdown and standalone code files are rendered with theme-aware syntax colouring via pandoc. Supports 50+ languages including TypeScript, Python, Rust, Go, C/C++, Julia, and more.
+- **Theme-aware** — matches your pi theme (dark/light, accent colours, syntax colours)
 - **Response picker** — select any past assistant response to preview, not just the latest
-- **File preview** — preview arbitrary `.md` files from the filesystem
+- **File preview** — preview arbitrary `.md` files or code files (`.py`, `.ts`, `.js`, `.rs`, etc.) from the filesystem. Code files are rendered with full syntax highlighting.
 - **Caching** — rendered pages are cached for instant re-display; refresh (`r`) bypasses cache
 
 ## Prerequisites
@@ -65,14 +70,14 @@ pi -e https://github.com/omaclaren/pi-markdown-preview
 |---------|-------------|
 | `/preview` | Preview the latest assistant response in terminal |
 | `/preview --pick` | Select from all assistant responses |
-| `/preview <path/to/file.md>` | Preview a markdown file |
-| `/preview --file <path/to/file.md>` | Preview a file (explicit flag) |
+| `/preview <path/to/file>` | Preview a markdown or code file |
+| `/preview --file <path/to/file>` | Preview a file (explicit flag) |
 | `/preview --browser` | Open preview in default browser |
 | `/preview-browser` | Shortcut for browser preview |
-| `/preview-browser <path/to/file.md>` | Open a file preview in browser |
+| `/preview-browser <path/to/file>` | Open a file preview in browser |
 | `/preview --pdf` | Export to PDF and open |
 | `/preview-pdf` | Shortcut for `--pdf` |
-| `/preview --pdf <path/to/file.md>` | Export a file to PDF |
+| `/preview --pdf <path/to/file>` | Export a file to PDF |
 | `/preview-clear-cache` | Clear rendered preview cache |
 | `/preview --pick --browser` | Pick a response, open in browser |
 
