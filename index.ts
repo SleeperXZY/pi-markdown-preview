@@ -454,11 +454,69 @@ function normalizeSubSupTags(markdown: string): string {
 	return out.join("\n");
 }
 
+function formatMarkdownImageDestination(rawPath: string): string {
+	const path = rawPath.trim();
+	if (!path) return "";
+	const unwrapped = path.startsWith("<") && path.endsWith(">") ? path.slice(1, -1).trim() : path;
+	// Angle brackets keep markdown image destinations valid for spaces/parentheses.
+	if (/[\s<>()]/.test(unwrapped)) return `<${unwrapped}>`;
+	return unwrapped;
+}
+
 function normalizeObsidianImages(markdown: string): string {
 	// Convert ![[path|alt]] and ![[path]] to standard markdown ![alt](path)
 	return markdown
-		.replace(/!\[\[([^|\]]+)\|([^\]]+)\]\]/g, "![$2]($1)")
-		.replace(/!\[\[([^\]]+)\]\]/g, "![]($1)");
+		.replace(/!\[\[([^|\]]+)\|([^\]]+)\]\]/g, (_match, path: string, alt: string) => {
+			return `![${alt}](${formatMarkdownImageDestination(path)})`;
+		})
+		.replace(/!\[\[([^\]]+)\]\]/g, (_match, path: string) => {
+			return `![](${formatMarkdownImageDestination(path)})`;
+		});
+}
+
+function extractLikelyImageDestination(rawDestination: string): string {
+	const trimmed = rawDestination.trim();
+	if (!trimmed) return "";
+	if (trimmed.startsWith("<")) {
+		const close = trimmed.indexOf(">");
+		if (close > 0) return trimmed.slice(1, close).trim();
+	}
+	const firstWhitespace = trimmed.search(/\s/);
+	return firstWhitespace === -1 ? trimmed : trimmed.slice(0, firstWhitespace);
+}
+
+function isLikelyRelativeLocalImageDestination(destination: string): boolean {
+	if (!destination) return false;
+	if (destination.startsWith("/") || destination.startsWith("#")) return false;
+	if (destination.startsWith("\\\\")) return false;
+	if (/^[A-Za-z]:[\\/]/.test(destination)) return false;
+
+	const lower = destination.toLowerCase();
+	if (
+		lower.startsWith("http://")
+		|| lower.startsWith("https://")
+		|| lower.startsWith("data:")
+		|| lower.startsWith("file:")
+		|| lower.startsWith("blob:")
+		|| lower.startsWith("about:")
+	) {
+		return false;
+	}
+
+	return true;
+}
+
+function hasLikelyRelativeLocalImages(markdown: string): boolean {
+	const normalized = normalizeObsidianImages(markdown);
+	const imageRegex = /!\[[^\]]*]\(([^)]+)\)/g;
+	let match: RegExpExecArray | null;
+	while ((match = imageRegex.exec(normalized)) !== null) {
+		const destination = extractLikelyImageDestination(match[1] ?? "");
+		if (isLikelyRelativeLocalImageDestination(destination)) {
+			return true;
+		}
+	}
+	return false;
 }
 
 const MARKDOWN_EXTENSIONS = new Set(["md", "markdown", "mdx", "rmd"]);
@@ -492,7 +550,7 @@ const EXT_TO_LANG: Record<string, string> = {
 	cmake: "cmake",
 	lua: "lua",
 	perl: "perl", pl: "perl",
-	r: "r", R: "r",
+	r: "r",
 	jl: "julia",
 	scala: "scala",
 	clj: "clojure",
@@ -505,18 +563,31 @@ const EXT_TO_LANG: Record<string, string> = {
 	proto: "protobuf",
 	tf: "hcl", hcl: "hcl",
 	tex: "latex", latex: "latex",
+	diff: "diff", patch: "diff",
 	f90: "fortran", f95: "fortran", f03: "fortran", f: "fortran", for: "fortran",
 	m: "matlab",
 };
 
 function detectLanguageFromPath(filePath: string): string | undefined {
 	const ext = extname(filePath).replace(/^\./, "").toLowerCase();
-	return EXT_TO_LANG[ext];
+	if (ext) return EXT_TO_LANG[ext];
+
+	const baseLower = basename(filePath).toLowerCase();
+	if (baseLower === "dockerfile") return "dockerfile";
+	if (baseLower === "makefile") return "makefile";
+	return undefined;
 }
 
 function isMarkdownFile(filePath: string): boolean {
 	const ext = extname(filePath).replace(/^\./, "").toLowerCase();
 	return MARKDOWN_EXTENSIONS.has(ext);
+}
+
+const LATEX_EXTENSIONS = new Set(["tex", "latex"]);
+
+function isLatexFile(filePath: string): boolean {
+	const ext = extname(filePath).replace(/^\./, "").toLowerCase();
+	return LATEX_EXTENSIONS.has(ext);
 }
 
 function wrapCodeAsMarkdown(code: string, lang?: string, filePath?: string): string {
@@ -576,6 +647,12 @@ function getCachePaths(markdownPage: string, styleKey: string) {
 	};
 }
 
+function buildRenderCacheKey(styleKey: string, resourcePath?: string, isLatex?: boolean): string {
+	const format = isLatex ? "latex" : "markdown";
+	const resolvedResourcePath = resourcePath ? resolvePath(resourcePath) : "";
+	return `${styleKey}\u0000${format}\u0000${resolvedResourcePath}`;
+}
+
 async function readCachedPage(markdownPage: string, styleKey: string): Promise<CachedPage | undefined> {
 	const { pngPath, metaPath } = getCachePaths(markdownPage, styleKey);
 	if (!existsSync(pngPath)) {
@@ -614,11 +691,12 @@ async function waitForPageRenderReady(page: puppeteer.Page): Promise<void> {
 	});
 }
 
-async function renderPreview(markdown: string, style: PreviewStyle, signal?: AbortSignal, resourcePath?: string, skipCache?: boolean): Promise<RenderPreviewResult> {
-	const normalizedMarkdown = normalizeObsidianImages(normalizeMathDelimiters(markdown));
+async function renderPreview(markdown: string, style: PreviewStyle, signal?: AbortSignal, resourcePath?: string, skipCache?: boolean, isLatex?: boolean): Promise<RenderPreviewResult> {
+	const normalizedMarkdown = isLatex ? markdown : normalizeObsidianImages(normalizeMathDelimiters(markdown));
+	const cacheKey = buildRenderCacheKey(style.cacheKey, resourcePath, isLatex);
 
 	// Check cache for the full render (keyed on full markdown content).
-	const cached = skipCache ? undefined : await readCachedPage(normalizedMarkdown, style.cacheKey);
+	const cached = skipCache ? undefined : await readCachedPage(normalizedMarkdown, cacheKey);
 	if (cached) {
 		// Cached result stores page count in meta; individual page PNGs are stored separately.
 		const meta = cached as CachedPage & { pageCount?: number };
@@ -626,10 +704,10 @@ async function renderPreview(markdown: string, style: PreviewStyle, signal?: Abo
 		const pages: PreviewPage[] = [];
 		for (let i = 0; i < pageCount; i++) {
 			const pageKey = `${normalizedMarkdown}\u0000page${i}`;
-			const pageCached = i === 0 ? cached : await readCachedPage(pageKey, style.cacheKey);
+			const pageCached = i === 0 ? cached : await readCachedPage(pageKey, cacheKey);
 			if (!pageCached) {
 				// Cache is incomplete; re-render.
-				return renderPreview(markdown, style, signal, resourcePath, true);
+				return renderPreview(markdown, style, signal, resourcePath, true, isLatex);
 			}
 			pages.push({
 				base64Png: pageCached.buffer.toString("base64"),
@@ -643,7 +721,7 @@ async function renderPreview(markdown: string, style: PreviewStyle, signal?: Abo
 
 	await mkdir(CACHE_DIR, { recursive: true });
 
-	const fragmentHtml = await renderMarkdownToHtmlWithPandoc(normalizedMarkdown, resourcePath);
+	const fragmentHtml = await renderMarkdownToHtmlWithPandoc(normalizedMarkdown, resourcePath, isLatex);
 	const html = buildBrowserHtmlFromPandocFragment(fragmentHtml, style, resourcePath);
 
 	let browser: puppeteer.Browser | undefined;
@@ -726,7 +804,7 @@ async function renderPreview(markdown: string, style: PreviewStyle, signal?: Abo
 				index: 0,
 				total: 1,
 			});
-			await writeCachedPage(normalizedMarkdown, style.cacheKey, {
+			await writeCachedPage(normalizedMarkdown, cacheKey, {
 				buffer: fullScreenshot,
 				truncatedHeight: false,
 				pageCount: 1,
@@ -758,7 +836,7 @@ async function renderPreview(markdown: string, style: PreviewStyle, signal?: Abo
 
 				// Cache each page slice.
 				const pageKey = i === 0 ? normalizedMarkdown : `${normalizedMarkdown}\u0000page${i}`;
-				await writeCachedPage(pageKey, style.cacheKey, {
+				await writeCachedPage(pageKey, cacheKey, {
 					buffer: pageScreenshot,
 					truncatedHeight: false,
 					pageCount: i === 0 ? pageCount : undefined,
@@ -940,7 +1018,7 @@ class MarkdownPreviewOverlay {
 	}
 }
 
-async function renderWithLoader(ctx: ExtensionCommandContext, markdown: string, resourcePath?: string): Promise<RenderWithLoaderResult | null> {
+async function renderWithLoader(ctx: ExtensionCommandContext, markdown: string, resourcePath?: string, isLatex?: boolean): Promise<RenderWithLoaderResult | null> {
 	type LoaderResult = { ok: true; preview: RenderPreviewResult } | { ok: false; error: string } | { ok: false; cancelled: true };
 
 	const result = await ctx.ui.custom<LoaderResult>((tui, theme, _kb, done) => {
@@ -957,7 +1035,7 @@ async function renderWithLoader(ctx: ExtensionCommandContext, markdown: string, 
 		void (async () => {
 			try {
 				const style = getPreviewStyle(ctx.ui.theme);
-				const preview = await renderPreview(markdown, style, loader.signal, resourcePath);
+				const preview = await renderPreview(markdown, style, loader.signal, resourcePath, undefined, isLatex);
 				if (loader.signal.aborted) {
 					resolve({ ok: false, cancelled: true });
 					return;
@@ -975,7 +1053,7 @@ async function renderWithLoader(ctx: ExtensionCommandContext, markdown: string, 
 	if (!result) {
 		try {
 			const style = getPreviewStyle(ctx.ui.theme);
-			const preview = await renderPreview(markdown, style, undefined, resourcePath);
+			const preview = await renderPreview(markdown, style, undefined, resourcePath, undefined, isLatex);
 			return { preview, supportsCustomUi: false };
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -1061,14 +1139,14 @@ async function pickAssistantMessage(ctx: ExtensionCommandContext): Promise<strin
 	return selected ? selected.markdown : null;
 }
 
-async function openPreview(ctx: ExtensionCommandContext, markdownOverride?: string, resourcePath?: string): Promise<void> {
+async function openPreview(ctx: ExtensionCommandContext, markdownOverride?: string, resourcePath?: string, isLatex?: boolean): Promise<void> {
 	const markdown = markdownOverride ?? getLastAssistantMarkdown(ctx);
 	if (!markdown) {
 		ctx.ui.notify("No assistant markdown found in the current branch.", "warning");
 		return;
 	}
 
-	const rendered = await renderWithLoader(ctx, markdown, resourcePath);
+	const rendered = await renderWithLoader(ctx, markdown, resourcePath, isLatex);
 	if (!rendered) return;
 
 	const { preview: initialPreview, supportsCustomUi } = rendered;
@@ -1093,11 +1171,11 @@ async function openPreview(ctx: ExtensionCommandContext, markdownOverride?: stri
 			done,
 			async () => {
 				const style = getPreviewStyle(ctx.ui.theme);
-				const refreshed = await renderPreview(markdown, style, undefined, resourcePath, true);
+				const refreshed = await renderPreview(markdown, style, undefined, resourcePath, true, isLatex);
 				return refreshed;
 			},
 			async () => {
-				await openPreviewInBrowser(ctx, markdown, resourcePath);
+				await openPreviewInBrowser(ctx, markdown, resourcePath, isLatex);
 			},
 		),
 	);
@@ -1125,9 +1203,10 @@ async function openFileInDefaultBrowser(filePath: string): Promise<void> {
 	});
 }
 
-async function renderMarkdownToHtmlWithPandoc(markdown: string, resourcePath?: string): Promise<string> {
+async function renderMarkdownToHtmlWithPandoc(markdown: string, resourcePath?: string, isLatex?: boolean): Promise<string> {
 	const pandocCommand = process.env.PANDOC_PATH?.trim() || "pandoc";
-	const args = ["-f", "gfm+tex_math_dollars", "-t", "html5", "--mathml"];
+	const inputFormat = isLatex ? "latex" : "markdown+tex_math_dollars+autolink_bare_uris-raw_html";
+	const args = ["-f", inputFormat, "-t", "html5", "--mathml"];
 	if (resourcePath) args.push(`--resource-path=${resourcePath}`);
 
 	return await new Promise<string>((resolve, reject) => {
@@ -1201,12 +1280,89 @@ async function ensurePdfPreamble(): Promise<string> {
 	return PDF_PREAMBLE_PATH;
 }
 
+async function compileLatexToPdf(latexSource: string, outputPath: string, resourcePath?: string): Promise<void> {
+	const engine = process.env.PANDOC_PDF_ENGINE?.trim() || "xelatex";
+	const tmpDir = join(CACHE_DIR, `_latex_${Date.now()}`);
+	await mkdir(tmpDir, { recursive: true });
+
+	const texPath = join(tmpDir, "input.tex");
+	await writeFile(texPath, latexSource, "utf-8");
+
+	// Symlink resource directory contents so \includegraphics can find figures
+	if (resourcePath) {
+		const { readdirSync } = await import("node:fs");
+		try {
+			for (const entry of readdirSync(resourcePath)) {
+				const src = join(resourcePath, entry);
+				const dest = join(tmpDir, entry);
+				try { await import("node:fs/promises").then(fs => fs.symlink(src, dest)); } catch { /* ignore collisions */ }
+			}
+		} catch { /* resource dir unreadable, skip */ }
+	}
+
+	return await new Promise<void>((resolve, reject) => {
+		// Run twice for cross-references (\ref, \eqref, \label)
+		const runLatex = (pass: number) => {
+			const child = spawn(engine, [
+				"-interaction=nonstopmode",
+				"-halt-on-error",
+				"-output-directory", tmpDir,
+				texPath,
+			], { stdio: ["pipe", "pipe", "pipe"], cwd: tmpDir });
+
+			const stderrChunks: Buffer[] = [];
+			const stdoutChunks: Buffer[] = [];
+			child.stdout.on("data", (chunk: Buffer | string) => {
+				stdoutChunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+			});
+			child.stderr.on("data", (chunk: Buffer | string) => {
+				stderrChunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+			});
+
+			child.once("error", (error) => {
+				const errno = error as NodeJS.ErrnoException;
+				if (errno.code === "ENOENT") {
+					reject(new Error(
+						`${engine} was not found. Install TeX Live (brew install --cask mactex) or set PANDOC_PDF_ENGINE.`,
+					));
+					return;
+				}
+				reject(error);
+			});
+
+			child.once("close", (code) => {
+				if (code !== 0 && pass === 2) {
+					const log = Buffer.concat(stdoutChunks).toString("utf-8");
+					// Extract the first LaTeX error line for a useful message
+					const errorMatch = log.match(/^! .+$/m);
+					const hint = errorMatch ? errorMatch[0] : "";
+					reject(new Error(`${engine} failed (exit ${code})${hint ? `: ${hint}` : ""}`));
+					return;
+				}
+				if (pass === 1) {
+					runLatex(2);
+				} else {
+					// Copy PDF to output path
+					const generatedPdf = join(tmpDir, "input.pdf");
+					import("node:fs/promises").then(fs =>
+						fs.copyFile(generatedPdf, outputPath).then(() => resolve())
+					).catch(reject);
+				}
+			});
+
+			child.stdin.end();
+		};
+
+		runLatex(1);
+	});
+}
+
 async function renderMarkdownToPdf(markdown: string, outputPath: string, resourcePath?: string): Promise<void> {
 	const pandocCommand = process.env.PANDOC_PATH?.trim() || "pandoc";
 	const pdfEngine = process.env.PANDOC_PDF_ENGINE?.trim() || "xelatex";
 	const preamblePath = await ensurePdfPreamble();
 	const args = [
-		"-f", "gfm+tex_math_dollars+superscript+subscript",
+		"-f", "markdown+tex_math_dollars+autolink_bare_uris+superscript+subscript-raw_html",
 		"-o", outputPath,
 		`--pdf-engine=${pdfEngine}`,
 		"-V", "geometry:margin=2.2cm",
@@ -1436,15 +1592,15 @@ async function preprocessMermaidForPdf(markdown: string): Promise<MermaidPdfPrep
 	};
 }
 
-async function exportPdf(ctx: ExtensionCommandContext, markdownOverride?: string, resourcePath?: string): Promise<void> {
+async function exportPdf(ctx: ExtensionCommandContext, markdownOverride?: string, resourcePath?: string, isLatex?: boolean): Promise<void> {
 	const markdown = markdownOverride ?? getLastAssistantMarkdown(ctx);
 	if (!markdown) {
 		ctx.ui.notify("No assistant markdown found in the current branch.", "warning");
 		return;
 	}
 
-	const normalizedMarkdown = normalizeSubSupTags(normalizeObsidianImages(normalizeMathDelimiters(markdown)));
-	const mermaidPrepared = await preprocessMermaidForPdf(normalizedMarkdown);
+	const normalizedMarkdown = isLatex ? markdown : normalizeSubSupTags(normalizeObsidianImages(normalizeMathDelimiters(markdown)));
+	const mermaidPrepared = isLatex ? { markdown: normalizedMarkdown, found: 0, replaced: 0, failed: 0, missingCli: false } : await preprocessMermaidForPdf(normalizedMarkdown);
 
 	if (mermaidPrepared.missingCli) {
 		ctx.ui.notify(
@@ -1469,7 +1625,11 @@ async function exportPdf(ctx: ExtensionCommandContext, markdownOverride?: string
 	const pdfPath = join(CACHE_DIR, `${hash}.pdf`);
 
 	await mkdir(CACHE_DIR, { recursive: true });
-	await renderMarkdownToPdf(markdownForPdf, pdfPath, resourcePath);
+	if (isLatex) {
+		await compileLatexToPdf(markdownForPdf, pdfPath, resourcePath);
+	} else {
+		await renderMarkdownToPdf(markdownForPdf, pdfPath, resourcePath);
+	}
 	await openFileInDefaultBrowser(pdfPath);
 }
 
@@ -1670,15 +1830,15 @@ body {
 </html>`;
 }
 
-async function openPreviewInBrowser(ctx: ExtensionCommandContext, markdownOverride?: string, resourcePath?: string): Promise<void> {
+async function openPreviewInBrowser(ctx: ExtensionCommandContext, markdownOverride?: string, resourcePath?: string, isLatex?: boolean): Promise<void> {
 	const markdown = markdownOverride ?? getLastAssistantMarkdown(ctx);
 	if (!markdown) {
 		throw new Error("No assistant markdown found in the current branch.");
 	}
 
 	const style = getPreviewStyle(ctx.ui.theme);
-	const normalizedMarkdown = normalizeObsidianImages(normalizeMathDelimiters(markdown));
-	const fragmentHtml = await renderMarkdownToHtmlWithPandoc(normalizedMarkdown, resourcePath);
+	const normalizedMarkdown = isLatex ? markdown : normalizeObsidianImages(normalizeMathDelimiters(markdown));
+	const fragmentHtml = await renderMarkdownToHtmlWithPandoc(normalizedMarkdown, resourcePath, isLatex);
 	const html = buildBrowserHtmlFromPandocFragment(fragmentHtml, style, resourcePath);
 	const hash = createHash("sha256")
 		.update(RENDER_VERSION)
@@ -1828,15 +1988,19 @@ export default function (pi: ExtensionAPI) {
 
 		let markdown: string | undefined;
 		let resourcePath: string | undefined;
+		let isLatex = false;
 		if (parsed.file) {
 			try {
 				const expanded = parsed.file.startsWith("~/") ? join(homedir(), parsed.file.slice(2))
 					: parsed.file === "~" ? homedir()
 					: parsed.file;
-				const filePath = resolvePath(expanded);
+				const filePath = resolvePath(ctx.cwd, expanded);
 				const fileContent = await readFile(filePath, "utf-8");
 				resourcePath = dirname(filePath);
-				if (isMarkdownFile(filePath)) {
+				if (isLatexFile(filePath)) {
+					markdown = fileContent;
+					isLatex = true;
+				} else if (isMarkdownFile(filePath)) {
 					markdown = fileContent;
 				} else {
 					const lang = detectLanguageFromPath(filePath);
@@ -1853,9 +2017,17 @@ export default function (pi: ExtensionAPI) {
 			markdown = picked;
 		}
 
+		const effectiveMarkdown = markdown ?? getLastAssistantMarkdown(ctx);
+		if (!resourcePath && effectiveMarkdown && hasLikelyRelativeLocalImages(effectiveMarkdown)) {
+			ctx.ui.notify(
+				"Relative local image paths may not resolve for assistant-response previews. Use /preview --file <path> for reliable local image loading.",
+				"warning",
+			);
+		}
+
 		if (parsed.target === "browser") {
 			try {
-				await openPreviewInBrowser(ctx, markdown, resourcePath);
+				await openPreviewInBrowser(ctx, markdown, resourcePath, isLatex);
 				ctx.ui.notify("Opened preview in browser.", "info");
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
@@ -1866,7 +2038,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (parsed.target === "pdf") {
 			try {
-				await exportPdf(ctx, markdown, resourcePath);
+				await exportPdf(ctx, markdown, resourcePath, isLatex);
 				ctx.ui.notify("Opened PDF preview.", "info");
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
@@ -1875,7 +2047,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		await openPreview(ctx, markdown, resourcePath);
+		await openPreview(ctx, markdown, resourcePath, isLatex);
 	};
 
 	pi.registerCommand("preview", {

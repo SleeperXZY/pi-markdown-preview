@@ -1,10 +1,11 @@
 {
   "name": "pi-markdown-preview",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Rendered markdown + LaTeX preview for pi, with terminal, browser, and PDF output",
   "type": "module",
   "scripts": {
-    "check:readme-commands": "node ./scripts/check-readme-commands.mjs"
+    "check:readme-commands": "node ./scripts/check-readme-commands.mjs",
+    "check:regressions": "node ./test/regressions.mjs"
   },
   "license": "MIT",
   "keywords": [

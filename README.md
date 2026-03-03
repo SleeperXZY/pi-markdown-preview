@@ -35,7 +35,7 @@ Preview adapts to your pi theme. Examples with a custom theme and the built-in d
 - **Syntax highlighting** — fenced code blocks in markdown and standalone code files are rendered with theme-aware syntax colouring via pandoc. Supports 50+ languages including TypeScript, Python, Rust, Go, C/C++, Julia, and more.
 - **Theme-aware** — matches your pi theme (dark/light, accent colours, syntax colours)
 - **Response picker** — select any past assistant response to preview, not just the latest
-- **File preview** — preview arbitrary `.md` files or code files (`.py`, `.ts`, `.js`, `.rs`, etc.) from the filesystem. Code files are rendered with full syntax highlighting.
+- **File preview** — preview arbitrary `.md` files, LaTeX `.tex` files, diff/patch files, or code files (`.py`, `.ts`, `.js`, `.rs`, etc.) from the filesystem. LaTeX files are rendered as documents with full math and sectioning; diff files are rendered with coloured add/remove lines; code files are rendered with syntax highlighting.
 - **Caching** — rendered pages are cached for instant re-display; refresh (`r`) bypasses cache
 
 ## Prerequisites
