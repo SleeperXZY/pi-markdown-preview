@@ -24,7 +24,7 @@ import puppeteer from "puppeteer-core";
 
 const CACHE_DIR = join(homedir(), ".pi", "cache", "markdown-preview");
 const MERMAID_PDF_CACHE_DIR = join(CACHE_DIR, "mermaid-pdf");
-const RENDER_VERSION = "v12";
+const RENDER_VERSION = "v13";
 const VIEWPORT_WIDTH_PX = 1200;
 const PAGE_HEIGHT_PX = 2200;
 const MAX_RENDER_HEIGHT_PX = 66000; // PAGE_HEIGHT_PX * 30
@@ -451,6 +451,69 @@ function normalizeSubSupTags(markdown: string): string {
 	}
 
 	flushPlain();
+	return out.join("\n");
+}
+
+function escapeLatexInlineText(text: string): string {
+	return text
+		.replace(/\\/g, "\\textbackslash{}")
+		.replace(/([{}$&#_%])/g, "\\$1")
+		.replace(/~/g, "\\textasciitilde{}")
+		.replace(/\^/g, "\\textasciicircum{}");
+}
+
+function replaceAnnotationMarkersInLineForPdf(line: string): string {
+	if (!line.includes("[an:")) return line;
+	const segments = line.split(/(`+[^`]*`+)/g);
+	return segments
+		.map((segment, index) => {
+			if (index % 2 === 1) return segment;
+			return segment.replace(/\[an:\s*([^\]\n]+?)\]/gi, (_match, note: string) => {
+				const trimmed = String(note ?? "").trim();
+				if (!trimmed) return "";
+				return `\\piannotation{${escapeLatexInlineText(trimmed)}}`;
+			});
+		})
+		.join("");
+}
+
+function highlightAnnotationMarkersForPdf(markdown: string): string {
+	const lines = markdown.split("\n");
+	const out: string[] = [];
+	let inFence = false;
+	let fenceChar: "`" | "~" | undefined;
+	let fenceLength = 0;
+
+	for (const line of lines) {
+		const trimmed = line.trimStart();
+		const fenceMatch = trimmed.match(/^(`{3,}|~{3,})/);
+
+		if (fenceMatch) {
+			const marker = fenceMatch[1]!;
+			const markerChar = marker[0] as "`" | "~";
+			const markerLength = marker.length;
+
+			if (!inFence) {
+				inFence = true;
+				fenceChar = markerChar;
+				fenceLength = markerLength;
+			} else if (fenceChar === markerChar && markerLength >= fenceLength) {
+				inFence = false;
+				fenceChar = undefined;
+				fenceLength = 0;
+			}
+
+			out.push(line);
+			continue;
+		}
+
+		if (inFence) {
+			out.push(line);
+		} else {
+			out.push(replaceAnnotationMarkersInLineForPdf(line));
+		}
+	}
+
 	return out.join("\n");
 }
 
@@ -1270,6 +1333,8 @@ const PDF_PREAMBLE = `\\usepackage{titlesec}
 \\setlist[itemize]{nosep, leftmargin=1.5em}
 \\setlist[enumerate]{nosep, leftmargin=1.5em}
 \\usepackage{parskip}
+\\usepackage{xcolor}
+\\newcommand{\\piannotation}[1]{\\begingroup\\setlength{\\fboxsep}{1.6pt}\\colorbox{blue!12}{\\textcolor{blue!65!black}{\\ttfamily #1}}\\endgroup}
 `;
 
 const PDF_PREAMBLE_PATH = join(CACHE_DIR, "_pdf_preamble.tex");
@@ -1614,7 +1679,7 @@ async function exportPdf(ctx: ExtensionCommandContext, markdownOverride?: string
 		);
 	}
 
-	const markdownForPdf = mermaidPrepared.markdown;
+	const markdownForPdf = isLatex ? mermaidPrepared.markdown : highlightAnnotationMarkersForPdf(mermaidPrepared.markdown);
 	const hash = createHash("sha256")
 		.update(RENDER_VERSION)
 		.update("\u0000")
@@ -1661,6 +1726,8 @@ function buildBrowserHtmlFromPandocFragment(fragmentHtml: string, style: Preview
   --syntax-operator: ${palette.syntaxOperator};
   --syntax-punctuation: ${palette.syntaxPunctuation};
   --syntax-error: ${style.themeMode === "dark" ? "#ff7b72" : "#cf222e"};
+  --annotation-bg: ${style.themeMode === "dark" ? "rgba(88, 166, 255, 0.22)" : "rgba(9, 105, 218, 0.14)"};
+  --annotation-border: ${style.themeMode === "dark" ? "rgba(88, 166, 255, 0.62)" : "rgba(9, 105, 218, 0.40)"};
 }
 * { box-sizing: border-box; }
 html, body {
@@ -1720,6 +1787,13 @@ body {
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 0.12em 0.35em;
+}
+#preview-root .annotation-marker {
+  display: inline;
+  border-radius: 4px;
+  border: 1px solid var(--annotation-border);
+  background: var(--annotation-bg);
+  padding: 0 0.28em;
 }
 #preview-root code span.kw,
 #preview-root code span.cf,
@@ -1799,8 +1873,63 @@ body {
   <article id="preview-root">${fragmentHtml}</article>
   <script type="module">
   (async () => {
+    const ANNOTATION_REGEX = /\\[an:\\s*([^\\]\\n]+?)\\]/gi;
+
+    const applyAnnotationMarkers = (root) => {
+      if (!root) return;
+      const walker = document.createTreeWalker(root, 4);
+      const matches = [];
+      let node = walker.nextNode();
+
+      while (node) {
+        const textNode = node;
+        const value = typeof textNode.nodeValue === 'string' ? textNode.nodeValue : '';
+        ANNOTATION_REGEX.lastIndex = 0;
+        if (value && ANNOTATION_REGEX.test(value)) {
+          const parent = textNode.parentElement;
+          if (parent && !parent.closest('pre, code, script, style, textarea')) {
+            matches.push(textNode);
+          }
+        }
+        ANNOTATION_REGEX.lastIndex = 0;
+        node = walker.nextNode();
+      }
+
+      matches.forEach((textNode) => {
+        const text = typeof textNode.nodeValue === 'string' ? textNode.nodeValue : '';
+        if (!text) return;
+        ANNOTATION_REGEX.lastIndex = 0;
+        if (!ANNOTATION_REGEX.test(text)) return;
+        ANNOTATION_REGEX.lastIndex = 0;
+
+        const fragment = document.createDocumentFragment();
+        let last = 0;
+        let match;
+        while ((match = ANNOTATION_REGEX.exec(text)) !== null) {
+          const token = match[0] || '';
+          const note = (match[1] || '').trim();
+          const start = match.index || 0;
+          if (start > last) fragment.appendChild(document.createTextNode(text.slice(last, start)));
+
+          if (note) {
+            const marker = document.createElement('span');
+            marker.className = 'annotation-marker';
+            marker.textContent = note;
+            fragment.appendChild(marker);
+          }
+
+          last = start + token.length;
+        }
+        if (last < text.length) fragment.appendChild(document.createTextNode(text.slice(last)));
+        const parent = textNode.parentNode;
+        if (parent) parent.replaceChild(fragment, textNode);
+      });
+    };
+
+    const root = document.getElementById('preview-root');
     const mermaidBlocks = document.querySelectorAll('pre.mermaid');
     if (mermaidBlocks.length === 0) {
+      applyAnnotationMarkers(root);
       window.__mermaidDone = true;
       return;
     }
@@ -1823,6 +1952,8 @@ body {
       });
       await mermaid.run();
     } catch (e) { console.error('Mermaid render failed:', e); }
+
+    applyAnnotationMarkers(root);
     window.__mermaidDone = true;
   })();
   </script>
