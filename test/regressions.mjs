@@ -19,8 +19,21 @@ assert.match(
 );
 assert.match(
 	src,
+	/\["-f", inputFormat, "-t", "html5", "--mathml", "--wrap=none"\]/,
+	"HTML preview should pass --wrap=none so long annotation markers survive pandoc wrapping.",
+);
+assert.match(
+	src,
 	/markdown\+tex_math_dollars\+autolink_bare_uris\+superscript\+subscript-raw_html/,
 	"PDF input format should disable raw HTML.",
+);
+assert.ok(
+	src.includes(String.raw`\\usepackage{soul}`),
+	"PDF preamble should use soul for wrap-friendly annotation highlighting.",
+);
+assert.ok(
+	src.includes(String.raw`\\hl{\\texttt{#1}}`),
+	"PDF annotation macro should use highlight + texttt so long notes can wrap.",
 );
 
 assert.match(
@@ -55,6 +68,11 @@ assert.match(
 	src,
 	/hasLikelyRelativeLocalImages\(effectiveMarkdown\)/,
 	"Expected warning hook for likely unresolved relative images.",
+);
+
+assert.ok(
+	src.includes(String.raw`const ANNOTATION_REGEX = /\\[an:\\s*([^\\]]+?)\\]/gi;`),
+	"Browser annotation regex should allow embedded newlines inside [an: ...] markers.",
 );
 
 console.log("Regression checks passed.");

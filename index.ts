@@ -24,7 +24,7 @@ import puppeteer from "puppeteer-core";
 
 const CACHE_DIR = join(homedir(), ".pi", "cache", "markdown-preview");
 const MERMAID_PDF_CACHE_DIR = join(CACHE_DIR, "mermaid-pdf");
-const RENDER_VERSION = "v13";
+const RENDER_VERSION = "v15";
 const VIEWPORT_WIDTH_PX = 1200;
 const PAGE_HEIGHT_PX = 2200;
 const MAX_RENDER_HEIGHT_PX = 66000; // PAGE_HEIGHT_PX * 30
@@ -1269,7 +1269,7 @@ async function openFileInDefaultBrowser(filePath: string): Promise<void> {
 async function renderMarkdownToHtmlWithPandoc(markdown: string, resourcePath?: string, isLatex?: boolean): Promise<string> {
 	const pandocCommand = process.env.PANDOC_PATH?.trim() || "pandoc";
 	const inputFormat = isLatex ? "latex" : "markdown+tex_math_dollars+autolink_bare_uris-raw_html";
-	const args = ["-f", inputFormat, "-t", "html5", "--mathml"];
+	const args = ["-f", inputFormat, "-t", "html5", "--mathml", "--wrap=none"];
 	if (resourcePath) args.push(`--resource-path=${resourcePath}`);
 
 	return await new Promise<string>((resolve, reject) => {
@@ -1334,7 +1334,9 @@ const PDF_PREAMBLE = `\\usepackage{titlesec}
 \\setlist[enumerate]{nosep, leftmargin=1.5em}
 \\usepackage{parskip}
 \\usepackage{xcolor}
-\\newcommand{\\piannotation}[1]{\\begingroup\\setlength{\\fboxsep}{1.6pt}\\colorbox{blue!12}{\\textcolor{blue!65!black}{\\ttfamily #1}}\\endgroup}
+\\usepackage{soul}
+\\sethlcolor{blue!12}
+\\newcommand{\\piannotation}[1]{\\begingroup\\textcolor{blue!65!black}{\\hl{\\texttt{#1}}}\\endgroup}
 `;
 
 const PDF_PREAMBLE_PATH = join(CACHE_DIR, "_pdf_preamble.tex");
@@ -1873,7 +1875,7 @@ body {
   <article id="preview-root">${fragmentHtml}</article>
   <script type="module">
   (async () => {
-    const ANNOTATION_REGEX = /\\[an:\\s*([^\\]\\n]+?)\\]/gi;
+    const ANNOTATION_REGEX = /\\[an:\\s*([^\\]]+?)\\]/gi;
 
     const applyAnnotationMarkers = (root) => {
       if (!root) return;
