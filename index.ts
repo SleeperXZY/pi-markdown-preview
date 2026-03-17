@@ -1130,7 +1130,11 @@ async function renderWithLoader(ctx: ExtensionCommandContext, markdown: string, 
 			ctx.ui.notify("Preview cancelled.", "info");
 			return null;
 		}
-		ctx.ui.notify(`Preview failed: ${result.error}`, "error");
+		if ("error" in result) {
+			ctx.ui.notify(`Preview failed: ${result.error}`, "error");
+			return null;
+		}
+		ctx.ui.notify("Preview failed.", "error");
 		return null;
 	}
 
@@ -1268,7 +1272,7 @@ async function openFileInDefaultBrowser(filePath: string): Promise<void> {
 
 async function renderMarkdownToHtmlWithPandoc(markdown: string, resourcePath?: string, isLatex?: boolean): Promise<string> {
 	const pandocCommand = process.env.PANDOC_PATH?.trim() || "pandoc";
-	const inputFormat = isLatex ? "latex" : "markdown+tex_math_dollars+autolink_bare_uris-raw_html";
+	const inputFormat = isLatex ? "latex" : "markdown+lists_without_preceding_blankline+tex_math_dollars+autolink_bare_uris-raw_html";
 	const args = ["-f", inputFormat, "-t", "html5", "--mathml", "--wrap=none"];
 	if (resourcePath) args.push(`--resource-path=${resourcePath}`);
 
@@ -1429,7 +1433,7 @@ async function renderMarkdownToPdf(markdown: string, outputPath: string, resourc
 	const pdfEngine = process.env.PANDOC_PDF_ENGINE?.trim() || "xelatex";
 	const preamblePath = await ensurePdfPreamble();
 	const args = [
-		"-f", "markdown+tex_math_dollars+autolink_bare_uris+superscript+subscript-raw_html",
+		"-f", "markdown+lists_without_preceding_blankline+tex_math_dollars+autolink_bare_uris+superscript+subscript-raw_html",
 		"-o", outputPath,
 		`--pdf-engine=${pdfEngine}`,
 		"-V", "geometry:margin=2.2cm",

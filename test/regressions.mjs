@@ -14,8 +14,8 @@ assert.match(
 
 assert.match(
 	src,
-	/markdown\+tex_math_dollars\+autolink_bare_uris-raw_html/,
-	"HTML preview input format should disable raw HTML.",
+	/markdown\+lists_without_preceding_blankline\+tex_math_dollars\+autolink_bare_uris-raw_html/,
+	"HTML preview input format should allow lists without a preceding blank line and disable raw HTML.",
 );
 assert.match(
 	src,
@@ -24,8 +24,8 @@ assert.match(
 );
 assert.match(
 	src,
-	/markdown\+tex_math_dollars\+autolink_bare_uris\+superscript\+subscript-raw_html/,
-	"PDF input format should disable raw HTML.",
+	/markdown\+lists_without_preceding_blankline\+tex_math_dollars\+autolink_bare_uris\+superscript\+subscript-raw_html/,
+	"PDF input format should allow lists without a preceding blank line and disable raw HTML.",
 );
 assert.ok(
 	src.includes(String.raw`\\usepackage{soul}`),
