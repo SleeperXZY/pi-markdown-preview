@@ -24,7 +24,7 @@ import puppeteer from "puppeteer-core";
 
 const CACHE_DIR = join(homedir(), ".pi", "cache", "markdown-preview");
 const MERMAID_PDF_CACHE_DIR = join(CACHE_DIR, "mermaid-pdf");
-const RENDER_VERSION = "v15";
+const RENDER_VERSION = "v16";
 const VIEWPORT_WIDTH_PX = 1200;
 const PAGE_HEIGHT_PX = 2200;
 const MAX_RENDER_HEIGHT_PX = 66000; // PAGE_HEIGHT_PX * 30
@@ -582,7 +582,7 @@ function hasLikelyRelativeLocalImages(markdown: string): boolean {
 	return false;
 }
 
-const MARKDOWN_EXTENSIONS = new Set(["md", "markdown", "mdx", "rmd"]);
+const MARKDOWN_EXTENSIONS = new Set(["md", "markdown", "mdx", "rmd", "qmd"]);
 
 const EXT_TO_LANG: Record<string, string> = {
 	ts: "typescript", tsx: "typescript", mts: "typescript", cts: "typescript",
@@ -626,6 +626,7 @@ const EXT_TO_LANG: Record<string, string> = {
 	proto: "protobuf",
 	tf: "hcl", hcl: "hcl",
 	tex: "latex", latex: "latex",
+	qmd: "markdown",
 	diff: "diff", patch: "diff",
 	f90: "fortran", f95: "fortran", f03: "fortran", f: "fortran", for: "fortran",
 	m: "matlab",
@@ -1272,7 +1273,7 @@ async function openFileInDefaultBrowser(filePath: string): Promise<void> {
 
 async function renderMarkdownToHtmlWithPandoc(markdown: string, resourcePath?: string, isLatex?: boolean): Promise<string> {
 	const pandocCommand = process.env.PANDOC_PATH?.trim() || "pandoc";
-	const inputFormat = isLatex ? "latex" : "markdown+lists_without_preceding_blankline+tex_math_dollars+autolink_bare_uris-raw_html";
+	const inputFormat = isLatex ? "latex" : "markdown+lists_without_preceding_blankline-blank_before_blockquote-blank_before_header+tex_math_dollars+autolink_bare_uris-raw_html";
 	const args = ["-f", inputFormat, "-t", "html5", "--mathml", "--wrap=none"];
 	if (resourcePath) args.push(`--resource-path=${resourcePath}`);
 
@@ -1433,7 +1434,7 @@ async function renderMarkdownToPdf(markdown: string, outputPath: string, resourc
 	const pdfEngine = process.env.PANDOC_PDF_ENGINE?.trim() || "xelatex";
 	const preamblePath = await ensurePdfPreamble();
 	const args = [
-		"-f", "markdown+lists_without_preceding_blankline+tex_math_dollars+autolink_bare_uris+superscript+subscript-raw_html",
+		"-f", "markdown+lists_without_preceding_blankline-blank_before_blockquote-blank_before_header+tex_math_dollars+autolink_bare_uris+superscript+subscript-raw_html",
 		"-o", outputPath,
 		`--pdf-engine=${pdfEngine}`,
 		"-V", "geometry:margin=2.2cm",
@@ -1864,6 +1865,12 @@ body {
   overflow-x: auto;
   overflow-y: hidden;
 }
+#preview-root mjx-container[display="true"] {
+  display: block;
+  margin: 1em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
 #preview-root .mermaid-container {
   text-align: center;
   margin: 1em 0;
@@ -1932,35 +1939,178 @@ body {
       });
     };
 
-    const root = document.getElementById('preview-root');
-    const mermaidBlocks = document.querySelectorAll('pre.mermaid');
-    if (mermaidBlocks.length === 0) {
-      applyAnnotationMarkers(root);
-      window.__mermaidDone = true;
-      return;
-    }
-    try {
-      const { default: mermaid } = await import('https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs');
-      mermaid.initialize({
-        startOnLoad: false,
-        theme: '${style.themeMode === "dark" ? "dark" : "default"}',
-      });
-      mermaidBlocks.forEach(pre => {
-        const code = pre.querySelector('code');
-        const src = code ? code.textContent : pre.textContent;
-        const wrapper = document.createElement('div');
-        wrapper.className = 'mermaid-container';
-        const div = document.createElement('div');
-        div.className = 'mermaid';
-        div.textContent = src;
-        wrapper.appendChild(div);
-        pre.replaceWith(wrapper);
-      });
-      await mermaid.run();
-    } catch (e) { console.error('Mermaid render failed:', e); }
+    const MATHJAX_CDN_URL = 'https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js';
 
-    applyAnnotationMarkers(root);
-    window.__mermaidDone = true;
+    const waitForFonts = async () => {
+      if ('fonts' in document) {
+        try {
+          await document.fonts.ready;
+        } catch {}
+      }
+    };
+
+    const waitForPaint = async () => {
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    };
+
+    const extractMathFallbackTex = (text, displayMode) => {
+      const source = typeof text === 'string' ? text.trim() : '';
+      if (!source) return '';
+
+      if (displayMode) {
+        if (source.startsWith('$$') && source.endsWith('$$') && source.length >= 4) {
+          return source.slice(2, -2).trim();
+        }
+        if (source.startsWith('\\\\[') && source.endsWith('\\\\]') && source.length >= 4) {
+          return source.slice(2, -2).trim();
+        }
+        return source;
+      }
+
+      if (source.startsWith('\\\\(') && source.endsWith('\\\\)') && source.length >= 4) {
+        return source.slice(2, -2).trim();
+      }
+      if (source.startsWith('$') && source.endsWith('$') && source.length >= 2) {
+        return source.slice(1, -1).trim();
+      }
+      return source;
+    };
+
+    const collectMathFallbackTargets = (root) => {
+      if (!root) return [];
+      const nodes = Array.from(root.querySelectorAll('.math.display, .math.inline'));
+      const targets = [];
+      const seenTargets = new Set();
+
+      nodes.forEach((node) => {
+        const displayMode = node.classList.contains('display');
+        const rawText = typeof node.textContent === 'string' ? node.textContent : '';
+        const tex = extractMathFallbackTex(rawText, displayMode);
+        if (!tex) return;
+
+        let renderTarget = node;
+        if (displayMode) {
+          const parent = node.parentElement;
+          const parentText = parent && typeof parent.textContent === 'string' ? parent.textContent.trim() : '';
+          if (parent && parent.tagName === 'P' && parentText === rawText.trim()) {
+            renderTarget = parent;
+          }
+        }
+
+        if (seenTargets.has(renderTarget)) return;
+        seenTargets.add(renderTarget);
+        targets.push({ renderTarget, displayMode, tex });
+      });
+
+      return targets;
+    };
+
+    let mathJaxPromise = null;
+    const ensureMathJax = () => {
+      if (window.MathJax && typeof window.MathJax.typesetPromise === 'function') {
+        return Promise.resolve(window.MathJax);
+      }
+      if (mathJaxPromise) return mathJaxPromise;
+
+      mathJaxPromise = new Promise((resolve, reject) => {
+        window.MathJax = {
+          loader: { load: ['[tex]/ams', '[tex]/noerrors', '[tex]/noundefined'] },
+          tex: {
+            inlineMath: [['\\\\(', '\\\\)'], ['$', '$']],
+            displayMath: [['\\\\[', '\\\\]'], ['$$', '$$']],
+            packages: { '[+]': ['ams', 'noerrors', 'noundefined'] },
+          },
+          options: {
+            skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'],
+          },
+          startup: { typeset: false },
+        };
+
+        const script = document.createElement('script');
+        script.src = MATHJAX_CDN_URL;
+        script.async = true;
+        script.onload = () => {
+          const api = window.MathJax;
+          if (api && api.startup && api.startup.promise && typeof api.startup.promise.then === 'function') {
+            api.startup.promise.then(() => resolve(api)).catch(reject);
+            return;
+          }
+          if (api && typeof api.typesetPromise === 'function') {
+            resolve(api);
+            return;
+          }
+          reject(new Error('MathJax did not initialize.'));
+        };
+        script.onerror = () => reject(new Error('Failed to load MathJax.'));
+        document.head.appendChild(script);
+      }).catch((error) => {
+        mathJaxPromise = null;
+        throw error;
+      });
+
+      return mathJaxPromise;
+    };
+
+    const renderMathFallback = async (root) => {
+      const fallbackTargets = collectMathFallbackTargets(root);
+      if (fallbackTargets.length === 0) return;
+
+      let mathJax;
+      try {
+        mathJax = await ensureMathJax();
+      } catch (e) {
+        console.error('MathJax load failed:', e);
+        return;
+      }
+
+      fallbackTargets.forEach(({ renderTarget, displayMode, tex }) => {
+        renderTarget.textContent = displayMode ? '\\\\[\\n' + tex + '\\n\\\\]' : '\\\\(' + tex + '\\\\)';
+      });
+
+      try {
+        await mathJax.typesetPromise(fallbackTargets.map(({ renderTarget }) => renderTarget));
+      } catch (e) {
+        console.error('MathJax render failed:', e);
+      }
+    };
+
+    const renderMermaid = async () => {
+      const mermaidBlocks = document.querySelectorAll('pre.mermaid');
+      if (mermaidBlocks.length === 0) return;
+
+      try {
+        const { default: mermaid } = await import('https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs');
+        mermaid.initialize({
+          startOnLoad: false,
+          theme: '${style.themeMode === "dark" ? "dark" : "default"}',
+        });
+        mermaidBlocks.forEach(pre => {
+          const code = pre.querySelector('code');
+          const src = code ? code.textContent : pre.textContent;
+          const wrapper = document.createElement('div');
+          wrapper.className = 'mermaid-container';
+          const div = document.createElement('div');
+          div.className = 'mermaid';
+          div.textContent = src;
+          wrapper.appendChild(div);
+          pre.replaceWith(wrapper);
+        });
+        await mermaid.run();
+      } catch (e) {
+        console.error('Mermaid render failed:', e);
+      }
+    };
+
+    const root = document.getElementById('preview-root');
+    try {
+      await renderMermaid();
+      applyAnnotationMarkers(root);
+      await renderMathFallback(root);
+      await waitForFonts();
+      await waitForPaint();
+    } finally {
+      window.__mermaidDone = true;
+    }
   })();
   </script>
 </body>
@@ -2193,7 +2343,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("preview-browser", {
-		description: "Open rendered markdown + LaTeX preview in the default browser (native MathML via pandoc)",
+		description: "Open rendered markdown + LaTeX preview in the default browser (MathML + selective MathJax fallback)",
 		handler: async (args, ctx) => {
 			await ctx.waitForIdle();
 			await run(`--browser ${args}`.trim(), ctx);

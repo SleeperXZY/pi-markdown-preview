@@ -14,8 +14,8 @@ assert.match(
 
 assert.match(
 	src,
-	/markdown\+lists_without_preceding_blankline\+tex_math_dollars\+autolink_bare_uris-raw_html/,
-	"HTML preview input format should allow lists without a preceding blank line and disable raw HTML.",
+	/markdown\+lists_without_preceding_blankline-blank_before_blockquote-blank_before_header\+tex_math_dollars\+autolink_bare_uris-raw_html/,
+	"HTML preview input format should allow lists, blockquotes, and headings without a preceding blank line and disable raw HTML.",
 );
 assert.match(
 	src,
@@ -24,8 +24,8 @@ assert.match(
 );
 assert.match(
 	src,
-	/markdown\+lists_without_preceding_blankline\+tex_math_dollars\+autolink_bare_uris\+superscript\+subscript-raw_html/,
-	"PDF input format should allow lists without a preceding blank line and disable raw HTML.",
+	/markdown\+lists_without_preceding_blankline-blank_before_blockquote-blank_before_header\+tex_math_dollars\+autolink_bare_uris\+superscript\+subscript-raw_html/,
+	"PDF input format should allow lists, blockquotes, and headings without a preceding blank line and disable raw HTML.",
 );
 assert.ok(
 	src.includes(String.raw`\\usepackage{soul}`),
@@ -52,6 +52,11 @@ assert.match(
 	/if \(baseLower === "makefile"\) return "makefile";/,
 	"Makefile basename detection should be supported.",
 );
+assert.match(
+	src,
+	/const MARKDOWN_EXTENSIONS = new Set\(\["md", "markdown", "mdx", "rmd", "qmd"\]\);/,
+	"Markdown extension detection should include .qmd files.",
+);
 
 assert.match(
 	src,
@@ -73,6 +78,15 @@ assert.match(
 assert.ok(
 	src.includes(String.raw`const ANNOTATION_REGEX = /\\[an:\\s*([^\\]]+?)\\]/gi;`),
 	"Browser annotation regex should allow embedded newlines inside [an: ...] markers.",
+);
+assert.ok(
+	src.includes("https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"),
+	"Browser/terminal preview should include a MathJax fallback loader for unsupported pandoc math.",
+);
+assert.match(
+	src,
+	/const renderMathFallback = async \(root\) =>/,
+	"Expected targeted MathJax fallback for pandoc-unsupported preview equations.",
 );
 
 console.log("Regression checks passed.");
