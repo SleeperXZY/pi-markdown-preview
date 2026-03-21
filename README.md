@@ -1,6 +1,6 @@
 # pi-markdown-preview
 
-Rendered markdown and LaTeX preview for [pi](https://github.com/badlogic/pi-mono). Preview assistant responses or arbitrary markdown files directly in your terminal, browser, or as PDF, with full math rendering, syntax highlighting, and theme-aware styling.
+Preview assistant responses and local Markdown, LaTeX, code, diff, and other text-based files from [pi](https://pi.dev) in the terminal, browser, or as PDF, with math rendering, syntax highlighting, Mermaid, and theme-aware styling.
 
 ## Screenshots
 
@@ -71,7 +71,7 @@ pi -e https://github.com/omaclaren/pi-markdown-preview
 |---------|-------------|
 | `/preview` | Preview the latest assistant response in terminal |
 | `/preview --pick` | Select from all assistant responses |
-| `/preview <path/to/file>` | Preview a markdown or code file |
+| `/preview <path/to/file>` | Preview a Markdown, LaTeX, diff, or code file |
 | `/preview --file <path/to/file>` | Preview a file (explicit flag) |
 | `/preview --browser` | Open preview in default browser |
 | `/preview-browser` | Shortcut for browser preview |
