@@ -24,7 +24,7 @@ import puppeteer from "puppeteer-core";
 
 const CACHE_DIR = join(homedir(), ".pi", "cache", "markdown-preview");
 const MERMAID_PDF_CACHE_DIR = join(CACHE_DIR, "mermaid-pdf");
-const RENDER_VERSION = "v16";
+const RENDER_VERSION = "v20";
 const VIEWPORT_WIDTH_PX = 1200;
 const PAGE_HEIGHT_PX = 2200;
 const MAX_RENDER_HEIGHT_PX = 66000; // PAGE_HEIGHT_PX * 30
@@ -328,6 +328,19 @@ function isLikelyMathExpression(expr: string): boolean {
 	return false;
 }
 
+function collapseDisplayMathContent(expr: string): string {
+	let content = expr.trim();
+	if (/\\begin\{[^}]+\}|\\end\{[^}]+\}/.test(content)) {
+		return content;
+	}
+	if (content.includes("\\\\") || content.includes("\n")) {
+		content = content.replace(/\\\\\s*/g, " ");
+		content = content.replace(/\s*\n\s*/g, " ");
+		content = content.replace(/\s{2,}/g, " ").trim();
+	}
+	return content;
+}
+
 function normalizeMathDelimitersInSegment(markdown: string): string {
 	let normalized = markdown.replace(/\\\[\s*([\s\S]*?)\s*\\\]/g, (match, expr: string) => {
 		const content = expr.trim();
@@ -454,12 +467,168 @@ function normalizeSubSupTags(markdown: string): string {
 	return out.join("\n");
 }
 
-function escapeLatexInlineText(text: string): string {
-	return text
+function escapeLatexTextFragment(text: string): string {
+	return String(text ?? "")
 		.replace(/\\/g, "\\textbackslash{}")
-		.replace(/([{}$&#_%])/g, "\\$1")
+		.replace(/([{}%#$&_])/g, "\\$1")
 		.replace(/~/g, "\\textasciitilde{}")
 		.replace(/\^/g, "\\textasciicircum{}");
+}
+
+function getMathPattern(): RegExp {
+	return /\\\(([\s\S]*?)\\\)|\\\[([\s\S]*?)\\\]|\$\$([\s\S]*?)\$\$|\$([^$\n]+?)\$/g;
+}
+
+function normalizeLatexAnnotationText(text: string): string {
+	return String(text ?? "")
+		.replace(/\r\n/g, "\n")
+		.replace(/\s*\n\s*/g, " ")
+		.replace(/\s{2,}/g, " ")
+		.trim();
+}
+
+function convertMathToVerbatimSafeTeX(expr: string): string {
+	let out = "";
+	let i = 0;
+	while (i < expr.length) {
+		const ch = expr[i]!;
+		if (ch !== "_" && ch !== "^") {
+			out += ch;
+			i += 1;
+			continue;
+		}
+
+		const command = ch === "_" ? "\\sb" : "\\sp";
+		i += 1;
+		while (i < expr.length && /\s/.test(expr[i]!)) i += 1;
+		if (i >= expr.length) {
+			out += ch;
+			break;
+		}
+
+		if (expr[i] === "{") {
+			let depth = 0;
+			const start = i;
+			while (i < expr.length) {
+				const current = expr[i]!;
+				if (current === "{") depth += 1;
+				if (current === "}") {
+					depth -= 1;
+					if (depth === 0) {
+						i += 1;
+						break;
+					}
+				}
+				i += 1;
+			}
+			out += `${command}${expr.slice(start, i)}`;
+			continue;
+		}
+
+		out += `${command}{${expr[i]!}}`;
+		i += 1;
+	}
+	return out;
+}
+
+function escapeLatexText(text: string): string {
+	const normalized = normalizeLatexAnnotationText(text);
+	if (!normalized) return "";
+
+	const mathPattern = getMathPattern();
+	let out = "";
+	let lastIndex = 0;
+	let match: RegExpExecArray | null;
+
+	while ((match = mathPattern.exec(normalized)) !== null) {
+		const token = match[0] ?? "";
+		const start = match.index;
+		if (start > lastIndex) {
+			out += escapeLatexTextFragment(normalized.slice(lastIndex, start));
+		}
+
+		const inlineParenExpr = match[1];
+		const displayBracketExpr = match[2];
+		const displayDollarExpr = match[3];
+		const inlineDollarExpr = match[4];
+		let mathLatex = "";
+
+		if (typeof inlineParenExpr === "string" && isLikelyMathExpression(inlineParenExpr)) {
+			const content = inlineParenExpr.trim();
+			mathLatex = content ? `\\(${content}\\)` : "";
+		} else if (typeof displayBracketExpr === "string" && isLikelyMathExpression(displayBracketExpr)) {
+			const content = collapseDisplayMathContent(displayBracketExpr);
+			mathLatex = content ? `\\(${content}\\)` : "";
+		} else if (typeof displayDollarExpr === "string" && isLikelyMathExpression(displayDollarExpr)) {
+			const content = collapseDisplayMathContent(displayDollarExpr);
+			mathLatex = content ? `\\(${content}\\)` : "";
+		} else if (typeof inlineDollarExpr === "string" && isLikelyMathExpression(inlineDollarExpr)) {
+			const content = inlineDollarExpr.trim();
+			mathLatex = content ? `\\(${content}\\)` : "";
+		}
+
+		out += mathLatex || escapeLatexTextFragment(token);
+		lastIndex = start + token.length;
+		if (token.length === 0) {
+			mathPattern.lastIndex += 1;
+		}
+	}
+
+	if (lastIndex < normalized.length) {
+		out += escapeLatexTextFragment(normalized.slice(lastIndex));
+	}
+
+	return out.trim();
+}
+
+function escapeLatexTextForVerbatimMath(text: string): string {
+	const normalized = normalizeLatexAnnotationText(text);
+	if (!normalized) return "";
+
+	const mathPattern = getMathPattern();
+	let out = "";
+	let lastIndex = 0;
+	let match: RegExpExecArray | null;
+
+	while ((match = mathPattern.exec(normalized)) !== null) {
+		const token = match[0] ?? "";
+		const start = match.index;
+		if (start > lastIndex) {
+			out += escapeLatexTextFragment(normalized.slice(lastIndex, start));
+		}
+
+		const inlineParenExpr = match[1];
+		const displayBracketExpr = match[2];
+		const displayDollarExpr = match[3];
+		const inlineDollarExpr = match[4];
+		let mathLatex = "";
+
+		if (typeof inlineParenExpr === "string" && isLikelyMathExpression(inlineParenExpr)) {
+			const content = convertMathToVerbatimSafeTeX(inlineParenExpr.trim());
+			mathLatex = content ? `\\(${content}\\)` : "";
+		} else if (typeof displayBracketExpr === "string" && isLikelyMathExpression(displayBracketExpr)) {
+			const content = convertMathToVerbatimSafeTeX(collapseDisplayMathContent(displayBracketExpr));
+			mathLatex = content ? `\\(${content}\\)` : "";
+		} else if (typeof displayDollarExpr === "string" && isLikelyMathExpression(displayDollarExpr)) {
+			const content = convertMathToVerbatimSafeTeX(collapseDisplayMathContent(displayDollarExpr));
+			mathLatex = content ? `\\(${content}\\)` : "";
+		} else if (typeof inlineDollarExpr === "string" && isLikelyMathExpression(inlineDollarExpr)) {
+			const content = convertMathToVerbatimSafeTeX(inlineDollarExpr.trim());
+			mathLatex = content ? `\\(${content}\\)` : "";
+		}
+
+		out += mathLatex || escapeLatexTextFragment(token);
+		lastIndex = start + token.length;
+		if (token.length === 0) {
+			mathPattern.lastIndex += 1;
+		}
+	}
+
+	if (lastIndex < normalized.length) {
+		out += escapeLatexTextFragment(normalized.slice(lastIndex));
+	}
+
+	return out.trim();
 }
 
 function replaceAnnotationMarkersInLineForPdf(line: string): string {
@@ -470,8 +639,9 @@ function replaceAnnotationMarkersInLineForPdf(line: string): string {
 			if (index % 2 === 1) return segment;
 			return segment.replace(/\[an:\s*([^\]\n]+?)\]/gi, (_match, note: string) => {
 				const trimmed = String(note ?? "").trim();
-				if (!trimmed) return "";
-				return `\\piannotation{${escapeLatexInlineText(trimmed)}}`;
+				const cleaned = escapeLatexText(trimmed);
+				if (!cleaned) return "";
+				return `\\piannotation{${cleaned}}`;
 			});
 		})
 		.join("");
@@ -654,10 +824,143 @@ function isLatexFile(filePath: string): boolean {
 	return LATEX_EXTENSIONS.has(ext);
 }
 
+function normalizeFenceLanguage(language: string | undefined): string | undefined {
+	const trimmed = typeof language === "string" ? language.trim().toLowerCase() : "";
+	if (!trimmed) return undefined;
+	if (trimmed === "patch" || trimmed === "udiff") return "diff";
+	return trimmed;
+}
+
+function getLongestFenceRun(text: string, fenceChar: "`" | "~"): number {
+	const regex = fenceChar === "`" ? /`+/g : /~+/g;
+	let max = 0;
+	let match: RegExpExecArray | null;
+	while ((match = regex.exec(text)) !== null) {
+		max = Math.max(max, match[0].length);
+	}
+	return max;
+}
+
 function wrapCodeAsMarkdown(code: string, lang?: string, filePath?: string): string {
 	const header = filePath ? `# ${basename(filePath)}\n\n` : "";
-	const fence = lang ? `\`\`\`${lang}` : "```";
-	return `${header}${fence}\n${code}\n\`\`\``;
+	const source = String(code ?? "").replace(/\r\n/g, "\n").trimEnd();
+	const language = normalizeFenceLanguage(lang) ?? "";
+	const maxBackticks = getLongestFenceRun(source, "`");
+	const maxTildes = getLongestFenceRun(source, "~");
+
+	let markerChar: "`" | "~" = "`";
+	if (maxBackticks === 0 && maxTildes === 0) {
+		markerChar = "`";
+	} else if (maxTildes < maxBackticks) {
+		markerChar = "~";
+	} else if (maxBackticks < maxTildes) {
+		markerChar = "`";
+	} else {
+		markerChar = maxBackticks > 0 ? "~" : "`";
+	}
+
+	const markerLength = Math.max(3, (markerChar === "`" ? maxBackticks : maxTildes) + 1);
+	const marker = markerChar.repeat(markerLength);
+	return `${header}${marker}${language}\n${source}\n${marker}`;
+}
+
+function extractFenceInfoLanguage(info: string): string | undefined {
+	const firstToken = String(info ?? "").trim().split(/\s+/)[0]?.replace(/^\./, "") ?? "";
+	return normalizeFenceLanguage(firstToken || undefined);
+}
+
+function normalizeMarkdownFencedBlocks(markdown: string): string {
+	const lines = String(markdown ?? "").replace(/\r\n/g, "\n").split("\n");
+	const out: string[] = [];
+
+	for (let index = 0; index < lines.length; index += 1) {
+		const line = lines[index] ?? "";
+		const openingMatch = line.match(/^(\s{0,3})(`{3,}|~{3,})([^\n]*)$/);
+		if (!openingMatch) {
+			out.push(line);
+			continue;
+		}
+
+		const indent = openingMatch[1] ?? "";
+		const openingFence = openingMatch[2]!;
+		const openingSuffix = openingMatch[3] ?? "";
+		const fenceChar = openingFence[0] as "`" | "~";
+		const fenceLength = openingFence.length;
+
+		let closingIndex = -1;
+		for (let innerIndex = index + 1; innerIndex < lines.length; innerIndex += 1) {
+			const innerLine = lines[innerIndex] ?? "";
+			const closingMatch = innerLine.match(/^\s{0,3}(`{3,}|~{3,})\s*$/);
+			if (!closingMatch) continue;
+			const closingFence = closingMatch[1]!;
+			if (closingFence[0] !== fenceChar || closingFence.length < fenceLength) continue;
+			closingIndex = innerIndex;
+			break;
+		}
+
+		if (closingIndex === -1) {
+			out.push(line);
+			continue;
+		}
+
+		const contentLines = lines.slice(index + 1, closingIndex);
+		const content = contentLines.join("\n");
+		const maxBackticks = getLongestFenceRun(content, "`");
+		const maxTildes = getLongestFenceRun(content, "~");
+		const currentMaxRun = fenceChar === "`" ? maxBackticks : maxTildes;
+
+		if (currentMaxRun < fenceLength) {
+			out.push(line, ...contentLines, lines[closingIndex] ?? "");
+			index = closingIndex;
+			continue;
+		}
+
+		const neededBackticks = Math.max(3, maxBackticks + 1);
+		const neededTildes = Math.max(3, maxTildes + 1);
+		let markerChar: "`" | "~" = fenceChar;
+
+		if (neededBackticks < neededTildes) {
+			markerChar = "`";
+		} else if (neededTildes < neededBackticks) {
+			markerChar = "~";
+		} else if (fenceChar === "`") {
+			markerChar = "~";
+		}
+
+		const markerLength = markerChar === "`" ? neededBackticks : neededTildes;
+		const marker = markerChar.repeat(markerLength);
+		out.push(`${indent}${marker}${openingSuffix}`, ...contentLines, `${indent}${marker}`);
+		index = closingIndex;
+	}
+
+	return out.join("\n");
+}
+
+function hasMarkdownDiffFence(markdown: string): boolean {
+	const lines = String(markdown ?? "").replace(/\r\n/g, "\n").split("\n");
+
+	for (let index = 0; index < lines.length; index += 1) {
+		const line = lines[index] ?? "";
+		const openingMatch = line.match(/^\s{0,3}(`{3,}|~{3,})([^\n]*)$/);
+		if (!openingMatch) continue;
+
+		const openingFence = openingMatch[1]!;
+		const infoLanguage = extractFenceInfoLanguage(openingMatch[2] ?? "");
+		if (infoLanguage !== "diff") continue;
+
+		const fenceChar = openingFence[0];
+		const fenceLength = openingFence.length;
+		for (let innerIndex = index + 1; innerIndex < lines.length; innerIndex += 1) {
+			const innerLine = lines[innerIndex] ?? "";
+			const closingMatch = innerLine.match(/^\s{0,3}(`{3,}|~{3,})\s*$/);
+			if (!closingMatch) continue;
+			const closingFence = closingMatch[1]!;
+			if (closingFence[0] !== fenceChar || closingFence.length < fenceLength) continue;
+			return true;
+		}
+	}
+
+	return false;
 }
 
 function getBrowserCandidates(): string[] {
@@ -756,7 +1059,7 @@ async function waitForPageRenderReady(page: puppeteer.Page): Promise<void> {
 }
 
 async function renderPreview(markdown: string, style: PreviewStyle, signal?: AbortSignal, resourcePath?: string, skipCache?: boolean, isLatex?: boolean): Promise<RenderPreviewResult> {
-	const normalizedMarkdown = isLatex ? markdown : normalizeObsidianImages(normalizeMathDelimiters(markdown));
+	const normalizedMarkdown = isLatex ? markdown : normalizeMarkdownFencedBlocks(normalizeObsidianImages(normalizeMathDelimiters(markdown)));
 	const cacheKey = buildRenderCacheKey(style.cacheKey, resourcePath, isLatex);
 
 	// Check cache for the full render (keyed on full markdown content).
@@ -1273,6 +1576,7 @@ async function openFileInDefaultBrowser(filePath: string): Promise<void> {
 
 async function renderMarkdownToHtmlWithPandoc(markdown: string, resourcePath?: string, isLatex?: boolean): Promise<string> {
 	const pandocCommand = process.env.PANDOC_PATH?.trim() || "pandoc";
+	const pandocInput = isLatex ? markdown : normalizeMarkdownFencedBlocks(markdown);
 	const inputFormat = isLatex ? "latex" : "markdown+lists_without_preceding_blankline-blank_before_blockquote-blank_before_header+tex_math_dollars+autolink_bare_uris-raw_html";
 	const args = ["-f", inputFormat, "-t", "html5", "--mathml", "--wrap=none"];
 	if (resourcePath) args.push(`--resource-path=${resourcePath}`);
@@ -1324,7 +1628,7 @@ async function renderMarkdownToHtmlWithPandoc(markdown: string, resourcePath?: s
 			fail(new Error(`pandoc failed with exit code ${code}${stderr ? `: ${stderr}` : ""}`));
 		});
 
-		child.stdin.end(markdown);
+		child.stdin.end(pandocInput);
 	});
 }
 
@@ -1339,9 +1643,28 @@ const PDF_PREAMBLE = `\\usepackage{titlesec}
 \\setlist[enumerate]{nosep, leftmargin=1.5em}
 \\usepackage{parskip}
 \\usepackage{xcolor}
-\\usepackage{soul}
-\\sethlcolor{blue!12}
-\\newcommand{\\piannotation}[1]{\\begingroup\\textcolor{blue!65!black}{\\hl{\\texttt{#1}}}\\endgroup}
+\\usepackage{varwidth}
+\\definecolor{PiAnnotationBg}{HTML}{EAF3FF}
+\\definecolor{PiAnnotationBorder}{HTML}{8CB8FF}
+\\definecolor{PiAnnotationText}{HTML}{1F5FBF}
+\\definecolor{PiDiffAddText}{HTML}{1A7F37}
+\\definecolor{PiDiffDelText}{HTML}{CF222E}
+\\definecolor{PiDiffMetaText}{HTML}{57606A}
+\\definecolor{PiDiffHunkText}{HTML}{0969DA}
+\\newcommand{\\piannotation}[1]{\\begingroup\\setlength{\\fboxsep}{1.5pt}\\fcolorbox{PiAnnotationBorder}{PiAnnotationBg}{\\begin{varwidth}{\\dimexpr\\linewidth-2\\fboxsep-2\\fboxrule\\relax}\\raggedright\\textcolor{PiAnnotationText}{\\sffamily\\strut #1}\\end{varwidth}}\\endgroup}
+\\newcommand{\\PiDiffAddTok}[1]{\\textcolor{PiDiffAddText}{#1}}
+\\newcommand{\\PiDiffDelTok}[1]{\\textcolor{PiDiffDelText}{#1}}
+\\newcommand{\\PiDiffMetaTok}[1]{\\textcolor{PiDiffMetaText}{#1}}
+\\newcommand{\\PiDiffHunkTok}[1]{\\textcolor{PiDiffHunkText}{#1}}
+\\newcommand{\\PiDiffHeaderTok}[1]{\\textcolor{PiDiffHunkText}{\\textbf{#1}}}
+\\usepackage{fvextra}
+\\makeatletter
+\\@ifundefined{Highlighting}{%
+  \\DefineVerbatimEnvironment{Highlighting}{Verbatim}{commandchars=\\\\\\{\\},breaklines,breakanywhere}%
+}{%
+  \\RecustomVerbatimEnvironment{Highlighting}{Verbatim}{commandchars=\\\\\\{\\},breaklines,breakanywhere}%
+}
+\\makeatother
 `;
 
 const PDF_PREAMBLE_PATH = join(CACHE_DIR, "_pdf_preamble.tex");
@@ -1431,6 +1754,7 @@ async function compileLatexToPdf(latexSource: string, outputPath: string, resour
 
 async function renderMarkdownToPdf(markdown: string, outputPath: string, resourcePath?: string): Promise<void> {
 	const pandocCommand = process.env.PANDOC_PATH?.trim() || "pandoc";
+	const pandocInput = normalizeMarkdownFencedBlocks(markdown);
 	const pdfEngine = process.env.PANDOC_PDF_ENGINE?.trim() || "xelatex";
 	const preamblePath = await ensurePdfPreamble();
 	const args = [
@@ -1488,8 +1812,191 @@ async function renderMarkdownToPdf(markdown: string, outputPath: string, resourc
 			fail(new Error(`pandoc PDF export failed with exit code ${code}${stderr ? `: ${stderr}` : ""}${hint}`));
 		});
 
-		child.stdin.end(markdown);
+		child.stdin.end(pandocInput);
 	});
+}
+
+function isGeneratedDiffHighlightingBlock(lines: string[]): boolean {
+	const body = lines.join("\n");
+	const hasAdditionOrDeletion = /\\VariableTok\{\+|\\StringTok\{\{-\}/.test(body);
+	const hasDiffStructure = /\\DataTypeTok\{@@|\\NormalTok\{diff \{-\}\{-\}git |\\KeywordTok\{\{-\}\{-\}\{-\}|\\DataTypeTok\{\+\+\+/.test(body);
+	return hasAdditionOrDeletion && hasDiffStructure;
+}
+
+function decodeGeneratedLatexCodeText(text: string): string {
+	return String(text ?? "")
+		.replace(/\\textbackslash\{\}/g, "\\")
+		.replace(/\\textasciitilde\{\}/g, "~")
+		.replace(/\\textasciicircum\{\}/g, "^")
+		.replace(/\\([{}_#$%&])/g, "$1");
+}
+
+function replaceAnnotationMarkersInDiffTokenLine(line: string, macroName: string): string {
+	const tokenMatch = line.match(new RegExp(`^\\\\${macroName}\\{([\\s\\S]*)\\}$`));
+	if (!tokenMatch) return line;
+
+	const body = tokenMatch[1] ?? "";
+	const markerPattern = /\[an:\s*([^\]]+?)\]/gi;
+	let lastIndex = 0;
+	let rewritten = "";
+	let match: RegExpExecArray | null;
+
+	const wrapText = (text: string): string => text ? `\\${macroName}{${text}}` : "";
+
+	while ((match = markerPattern.exec(body)) !== null) {
+		const token = match[0] ?? "";
+		const start = match.index;
+		if (start > lastIndex) {
+			rewritten += wrapText(body.slice(lastIndex, start));
+		}
+
+		const decodedMarkerText = decodeGeneratedLatexCodeText(match[1] ?? "");
+		const markerText = escapeLatexTextForVerbatimMath(decodedMarkerText);
+		if (markerText) {
+			rewritten += `\\piannotation{${markerText}}`;
+		}
+
+		lastIndex = start + token.length;
+		if (token.length === 0) {
+			markerPattern.lastIndex += 1;
+		}
+	}
+
+	if (lastIndex === 0) return line;
+	if (lastIndex < body.length) {
+		rewritten += wrapText(body.slice(lastIndex));
+	}
+
+	return rewritten || wrapText(body);
+}
+
+function rewriteGeneratedDiffHighlighting(latex: string): string {
+	const lines = String(latex ?? "").split("\n");
+	const out: string[] = [];
+
+	for (let index = 0; index < lines.length; index += 1) {
+		const line = lines[index] ?? "";
+		if (!/^\\begin\{Highlighting\}/.test(line)) {
+			out.push(line);
+			continue;
+		}
+
+		let closingIndex = -1;
+		for (let innerIndex = index + 1; innerIndex < lines.length; innerIndex += 1) {
+			if (/^\\end\{Highlighting\}/.test(lines[innerIndex] ?? "")) {
+				closingIndex = innerIndex;
+				break;
+			}
+		}
+
+		if (closingIndex === -1) {
+			out.push(line);
+			continue;
+		}
+
+		const blockLines = lines.slice(index, closingIndex + 1);
+		if (!isGeneratedDiffHighlightingBlock(blockLines)) {
+			out.push(...blockLines);
+			index = closingIndex;
+			continue;
+		}
+
+		const rewrittenBlock = blockLines.map((blockLine) => {
+			if (/^\\VariableTok\{/.test(blockLine)) {
+				return replaceAnnotationMarkersInDiffTokenLine(
+					blockLine.replace(/^\\VariableTok\{/, "\\PiDiffAddTok{"),
+					"PiDiffAddTok",
+				);
+			}
+			if (/^\\StringTok\{/.test(blockLine)) {
+				return replaceAnnotationMarkersInDiffTokenLine(
+					blockLine.replace(/^\\StringTok\{/, "\\PiDiffDelTok{"),
+					"PiDiffDelTok",
+				);
+			}
+			if (/^\\DataTypeTok\{@@/.test(blockLine)) return blockLine.replace(/^\\DataTypeTok\{/, "\\PiDiffHunkTok{");
+			if (/^\\DataTypeTok\{\+\+\+/.test(blockLine)) return blockLine.replace(/^\\DataTypeTok\{/, "\\PiDiffHeaderTok{");
+			if (/^\\KeywordTok\{\{-\}\{-\}\{-\}/.test(blockLine)) return blockLine.replace(/^\\KeywordTok\{/, "\\PiDiffHeaderTok{");
+			if (/^\\NormalTok\{(?:diff \{-\}\{-\}git |index |new file mode |deleted file mode |similarity index |rename from |rename to |Binary files )/.test(blockLine)) {
+				return replaceAnnotationMarkersInDiffTokenLine(
+					blockLine.replace(/^\\NormalTok\{/, "\\PiDiffMetaTok{"),
+					"PiDiffMetaTok",
+				);
+			}
+			return blockLine;
+		});
+
+		out.push(...rewrittenBlock);
+		index = closingIndex;
+	}
+
+	return out.join("\n");
+}
+
+async function renderMarkdownToPdfViaGeneratedLatex(markdown: string, outputPath: string, resourcePath?: string): Promise<void> {
+	const pandocCommand = process.env.PANDOC_PATH?.trim() || "pandoc";
+	const pandocInput = normalizeMarkdownFencedBlocks(markdown);
+	const preamblePath = await ensurePdfPreamble();
+	const args = [
+		"-f", "markdown+lists_without_preceding_blankline-blank_before_blockquote-blank_before_header+tex_math_dollars+autolink_bare_uris+superscript+subscript-raw_html",
+		"-t", "latex",
+		"-s",
+		"-V", "geometry:margin=2.2cm",
+		"-V", "fontsize=11pt",
+		"-V", "linestretch=1.25",
+		"-V", "urlcolor=blue",
+		"-V", "linkcolor=blue",
+		"--include-in-header", preamblePath,
+	];
+	if (resourcePath) args.push(`--resource-path=${resourcePath}`);
+
+	const generatedLatex = await new Promise<string>((resolve, reject) => {
+		const child = spawn(pandocCommand, args, { stdio: ["pipe", "pipe", "pipe"] });
+		const stdoutChunks: Buffer[] = [];
+		const stderrChunks: Buffer[] = [];
+		let settled = false;
+
+		const fail = (error: Error) => {
+			if (settled) return;
+			settled = true;
+			reject(error);
+		};
+
+		child.stdout.on("data", (chunk: Buffer | string) => {
+			stdoutChunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+		});
+		child.stderr.on("data", (chunk: Buffer | string) => {
+			stderrChunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+		});
+
+		child.once("error", (error) => {
+			const errno = error as NodeJS.ErrnoException;
+			if (errno.code === "ENOENT") {
+				fail(
+					new Error(
+						`pandoc was not found. Install pandoc or set PANDOC_PATH to the pandoc binary.`,
+					),
+				);
+				return;
+			}
+			fail(error);
+		});
+
+		child.once("close", (code) => {
+			if (settled) return;
+			if (code === 0) {
+				settled = true;
+				resolve(Buffer.concat(stdoutChunks).toString("utf-8"));
+				return;
+			}
+			const stderr = Buffer.concat(stderrChunks).toString("utf-8").trim();
+			fail(new Error(`pandoc LaTeX generation failed with exit code ${code}${stderr ? `: ${stderr}` : ""}`));
+		});
+
+		child.stdin.end(pandocInput);
+	});
+
+	await compileLatexToPdf(rewriteGeneratedDiffHighlighting(generatedLatex), outputPath, resourcePath);
 }
 
 class MermaidCliMissingError extends Error {}
@@ -1671,7 +2178,9 @@ async function exportPdf(ctx: ExtensionCommandContext, markdownOverride?: string
 		return;
 	}
 
-	const normalizedMarkdown = isLatex ? markdown : normalizeSubSupTags(normalizeObsidianImages(normalizeMathDelimiters(markdown)));
+	const normalizedMarkdown = isLatex
+		? markdown
+		: normalizeSubSupTags(normalizeMarkdownFencedBlocks(normalizeObsidianImages(normalizeMathDelimiters(markdown))));
 	const mermaidPrepared = isLatex ? { markdown: normalizedMarkdown, found: 0, replaced: 0, failed: 0, missingCli: false } : await preprocessMermaidForPdf(normalizedMarkdown);
 
 	if (mermaidPrepared.missingCli) {
@@ -1699,6 +2208,8 @@ async function exportPdf(ctx: ExtensionCommandContext, markdownOverride?: string
 	await mkdir(CACHE_DIR, { recursive: true });
 	if (isLatex) {
 		await compileLatexToPdf(markdownForPdf, pdfPath, resourcePath);
+	} else if (hasMarkdownDiffFence(markdownForPdf)) {
+		await renderMarkdownToPdfViaGeneratedLatex(markdownForPdf, pdfPath, resourcePath);
 	} else {
 		await renderMarkdownToPdf(markdownForPdf, pdfPath, resourcePath);
 	}
@@ -1735,6 +2246,16 @@ function buildBrowserHtmlFromPandocFragment(fragmentHtml: string, style: Preview
   --syntax-error: ${style.themeMode === "dark" ? "#ff7b72" : "#cf222e"};
   --annotation-bg: ${style.themeMode === "dark" ? "rgba(88, 166, 255, 0.22)" : "rgba(9, 105, 218, 0.14)"};
   --annotation-border: ${style.themeMode === "dark" ? "rgba(88, 166, 255, 0.62)" : "rgba(9, 105, 218, 0.40)"};
+  --annotation-text: ${style.themeMode === "dark" ? "#e6edf3" : "#1f2328"};
+  --diff-add-bg: ${style.themeMode === "dark" ? "rgba(46, 160, 67, 0.18)" : "rgba(26, 127, 55, 0.12)"};
+  --diff-add-text: ${style.themeMode === "dark" ? "#3fb950" : "#1a7f37"};
+  --diff-del-bg: ${style.themeMode === "dark" ? "rgba(248, 81, 73, 0.18)" : "rgba(207, 34, 46, 0.12)"};
+  --diff-del-text: ${style.themeMode === "dark" ? "#ff7b72" : "#cf222e"};
+  --diff-meta-text: ${style.themeMode === "dark" ? "#9da7b5" : "#57606a"};
+  --diff-header-bg: ${style.themeMode === "dark" ? "rgba(88, 166, 255, 0.10)" : "rgba(9, 105, 218, 0.08)"};
+  --diff-header-text: ${style.themeMode === "dark" ? "#79c0ff" : "#0969da"};
+  --diff-hunk-bg: ${style.themeMode === "dark" ? "rgba(88, 166, 255, 0.16)" : "rgba(9, 105, 218, 0.12)"};
+  --diff-hunk-text: ${style.themeMode === "dark" ? "#79c0ff" : "#0969da"};
 }
 * { box-sizing: border-box; }
 html, body {
@@ -1800,7 +2321,45 @@ body {
   border-radius: 4px;
   border: 1px solid var(--annotation-border);
   background: var(--annotation-bg);
+  color: var(--annotation-text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
   padding: 0 0.28em;
+}
+#preview-root .annotation-marker mjx-container {
+  margin: 0;
+}
+#preview-root pre.sourceCode.diff code > .diff-line {
+  display: block;
+  margin: 0 -4px;
+  padding: 0 4px;
+  border-radius: 4px;
+}
+#preview-root pre.sourceCode.diff code > .diff-add-line {
+  background: var(--diff-add-bg);
+  color: var(--diff-add-text);
+}
+#preview-root pre.sourceCode.diff code > .diff-del-line {
+  background: var(--diff-del-bg);
+  color: var(--diff-del-text);
+}
+#preview-root pre.sourceCode.diff code > .diff-meta-line {
+  color: var(--diff-meta-text);
+}
+#preview-root pre.sourceCode.diff code > .diff-header-line {
+  background: var(--diff-header-bg);
+  color: var(--diff-header-text);
+  font-weight: 600;
+}
+#preview-root pre.sourceCode.diff code > .diff-hunk-line {
+  background: var(--diff-hunk-bg);
+  color: var(--diff-hunk-text);
+}
+#preview-root pre.sourceCode.diff code > .diff-line .kw,
+#preview-root pre.sourceCode.diff code > .diff-line .dt,
+#preview-root pre.sourceCode.diff code > .diff-line .st,
+#preview-root pre.sourceCode.diff code > .diff-line .va {
+  color: inherit;
+  font-weight: inherit;
 }
 #preview-root code span.kw,
 #preview-root code span.cf,
@@ -1887,6 +2446,52 @@ body {
   <script type="module">
   (async () => {
     const ANNOTATION_REGEX = /\\[an:\\s*([^\\]]+?)\\]/gi;
+    const ANNOTATION_HTML_REGEX = new RegExp('\\\\[an:\\\\s*([\\\\s\\\\S]*?)\\\\]', 'gi');
+    const ANNOTATION_MATH_REGEX = new RegExp('\\\\$\\\\$([\\\\s\\\\S]*?)\\\\$\\\\$|\\\\$([^$\\\\n]+?)\\\\$', 'g');
+    const DIFF_META_LINE_REGEX = /^(diff --git |index |new file mode |deleted file mode |similarity index |rename from |rename to |Binary files )/;
+
+    const replaceAnnotationTextNode = (textNode) => {
+      const text = typeof textNode.nodeValue === 'string' ? textNode.nodeValue : '';
+      if (!text) return;
+      ANNOTATION_REGEX.lastIndex = 0;
+      if (!ANNOTATION_REGEX.test(text)) return;
+      ANNOTATION_REGEX.lastIndex = 0;
+
+      const fragment = document.createDocumentFragment();
+      let last = 0;
+      let match;
+      while ((match = ANNOTATION_REGEX.exec(text)) !== null) {
+        const token = match[0] || '';
+        const note = (match[1] || '').trim();
+        const start = match.index || 0;
+        if (start > last) fragment.appendChild(document.createTextNode(text.slice(last, start)));
+
+        if (note) {
+          const marker = document.createElement('span');
+          marker.className = 'annotation-marker';
+          marker.textContent = note;
+          fragment.appendChild(marker);
+        }
+
+        last = start + token.length;
+      }
+      if (last < text.length) fragment.appendChild(document.createTextNode(text.slice(last)));
+      const parent = textNode.parentNode;
+      if (parent) parent.replaceChild(fragment, textNode);
+    };
+
+    const applyRichTextAnnotationMarkers = (root) => {
+      if (!root) return;
+      const containers = Array.from(root.querySelectorAll('p, li, blockquote, td, th, h1, h2, h3, h4, h5, h6'));
+      containers.forEach((container) => {
+        const html = typeof container.innerHTML === 'string' ? container.innerHTML : '';
+        if (!html || !html.includes('[an:')) return;
+        container.innerHTML = html.replace(ANNOTATION_HTML_REGEX, (_match, noteHtml) => {
+          const note = String(noteHtml || '').replace(/^\s+|\s+$/g, '');
+          return note ? '<span class="annotation-marker">' + note + '</span>' : '';
+        });
+      });
+    };
 
     const applyAnnotationMarkers = (root) => {
       if (!root) return;
@@ -1900,7 +2505,7 @@ body {
         ANNOTATION_REGEX.lastIndex = 0;
         if (value && ANNOTATION_REGEX.test(value)) {
           const parent = textNode.parentElement;
-          if (parent && !parent.closest('pre, code, script, style, textarea')) {
+          if (parent && !parent.closest('pre, code, script, style, textarea, .annotation-marker')) {
             matches.push(textNode);
           }
         }
@@ -1908,34 +2513,48 @@ body {
         node = walker.nextNode();
       }
 
-      matches.forEach((textNode) => {
-        const text = typeof textNode.nodeValue === 'string' ? textNode.nodeValue : '';
-        if (!text) return;
-        ANNOTATION_REGEX.lastIndex = 0;
-        if (!ANNOTATION_REGEX.test(text)) return;
-        ANNOTATION_REGEX.lastIndex = 0;
+      matches.forEach(replaceAnnotationTextNode);
+    };
 
-        const fragment = document.createDocumentFragment();
-        let last = 0;
-        let match;
-        while ((match = ANNOTATION_REGEX.exec(text)) !== null) {
-          const token = match[0] || '';
-          const note = (match[1] || '').trim();
-          const start = match.index || 0;
-          if (start > last) fragment.appendChild(document.createTextNode(text.slice(last, start)));
+    const decorateDiffCodeBlocks = (root) => {
+      if (!root) return;
+      const diffBlocks = Array.from(root.querySelectorAll('pre.sourceCode.diff code'));
 
-          if (note) {
-            const marker = document.createElement('span');
-            marker.className = 'annotation-marker';
-            marker.textContent = note;
-            fragment.appendChild(marker);
+      diffBlocks.forEach((codeBlock) => {
+        const lineElements = Array.from(codeBlock.children).filter((child) => child instanceof HTMLElement);
+        lineElements.forEach((lineEl) => {
+          const text = typeof lineEl.textContent === 'string' ? lineEl.textContent : '';
+          if (!text) return;
+
+          if (/^\\+(?!\\+\\+)/.test(text)) {
+            lineEl.classList.add('diff-line', 'diff-add-line');
+          } else if (/^-(?!--)/.test(text)) {
+            lineEl.classList.add('diff-line', 'diff-del-line');
+          } else if (/^@@/.test(text)) {
+            lineEl.classList.add('diff-line', 'diff-hunk-line');
+          } else if (/^(?:\\+\\+\\+ |--- )/.test(text)) {
+            lineEl.classList.add('diff-line', 'diff-header-line');
+          } else if (DIFF_META_LINE_REGEX.test(text)) {
+            lineEl.classList.add('diff-line', 'diff-meta-line');
           }
 
-          last = start + token.length;
-        }
-        if (last < text.length) fragment.appendChild(document.createTextNode(text.slice(last)));
-        const parent = textNode.parentNode;
-        if (parent) parent.replaceChild(fragment, textNode);
+          const walker = document.createTreeWalker(lineEl, 4);
+          const matches = [];
+          let node = walker.nextNode();
+          while (node) {
+            const textNode = node;
+            const value = typeof textNode.nodeValue === 'string' ? textNode.nodeValue : '';
+            const parent = textNode.parentElement;
+            ANNOTATION_REGEX.lastIndex = 0;
+            if (value && parent && !parent.closest('a, .annotation-marker') && ANNOTATION_REGEX.test(value)) {
+              matches.push(textNode);
+            }
+            ANNOTATION_REGEX.lastIndex = 0;
+            node = walker.nextNode();
+          }
+
+          matches.forEach(replaceAnnotationTextNode);
+        });
       });
     };
 
@@ -2051,6 +2670,76 @@ body {
       return mathJaxPromise;
     };
 
+    const renderAnnotationMarkerMath = async (root) => {
+      if (!root) return;
+      const markers = Array.from(root.querySelectorAll('.annotation-marker')).filter((marker) => {
+        if (!(marker instanceof HTMLElement)) return false;
+        if (marker.querySelector('math, mjx-container')) return false;
+        const text = typeof marker.textContent === 'string' ? marker.textContent : '';
+        ANNOTATION_MATH_REGEX.lastIndex = 0;
+        return Boolean(text) && ANNOTATION_MATH_REGEX.test(text);
+      });
+      if (markers.length === 0) return;
+
+      let mathJax;
+      try {
+        mathJax = await ensureMathJax();
+      } catch (e) {
+        console.error('MathJax load failed:', e);
+        return;
+      }
+
+      for (const marker of markers) {
+        const text = typeof marker.textContent === 'string' ? marker.textContent : '';
+        if (!text) continue;
+
+        ANNOTATION_MATH_REGEX.lastIndex = 0;
+        const fragment = document.createDocumentFragment();
+        let last = 0;
+        let match;
+        while ((match = ANNOTATION_MATH_REGEX.exec(text)) !== null) {
+          const token = match[0] || '';
+          const start = typeof match.index === 'number' ? match.index : 0;
+          if (start > last) fragment.appendChild(document.createTextNode(text.slice(last, start)));
+
+          const displayDollarExpr = match[1];
+          const inlineDollarExpr = match[2];
+          const tex = typeof displayDollarExpr === 'string' ? displayDollarExpr.trim()
+            : typeof inlineDollarExpr === 'string' ? inlineDollarExpr.trim()
+            : '';
+          const display = typeof displayDollarExpr === 'string';
+
+          if (!tex) {
+            fragment.appendChild(document.createTextNode(token));
+          } else {
+            try {
+              let mathNode = null;
+              if (typeof mathJax.tex2chtmlPromise === 'function') {
+                mathNode = await mathJax.tex2chtmlPromise(tex, { display });
+              } else if (typeof mathJax.tex2chtml === 'function') {
+                mathNode = mathJax.tex2chtml(tex, { display });
+              }
+              if (mathNode) {
+                fragment.appendChild(mathNode);
+              } else {
+                fragment.appendChild(document.createTextNode(token));
+              }
+            } catch {
+              fragment.appendChild(document.createTextNode(token));
+            }
+          }
+
+          last = start + token.length;
+          if (token.length === 0) {
+            ANNOTATION_MATH_REGEX.lastIndex += 1;
+          }
+        }
+
+        if (last < text.length) fragment.appendChild(document.createTextNode(text.slice(last)));
+        marker.replaceChildren(fragment);
+      }
+    };
+
     const renderMathFallback = async (root) => {
       const fallbackTargets = collectMathFallbackTargets(root);
       if (fallbackTargets.length === 0) return;
@@ -2104,7 +2793,10 @@ body {
     const root = document.getElementById('preview-root');
     try {
       await renderMermaid();
+      applyRichTextAnnotationMarkers(root);
+      decorateDiffCodeBlocks(root);
       applyAnnotationMarkers(root);
+      await renderAnnotationMarkerMath(root);
       await renderMathFallback(root);
       await waitForFonts();
       await waitForPaint();
@@ -2124,7 +2816,7 @@ async function openPreviewInBrowser(ctx: ExtensionCommandContext, markdownOverri
 	}
 
 	const style = getPreviewStyle(ctx.ui.theme);
-	const normalizedMarkdown = isLatex ? markdown : normalizeObsidianImages(normalizeMathDelimiters(markdown));
+	const normalizedMarkdown = isLatex ? markdown : normalizeMarkdownFencedBlocks(normalizeObsidianImages(normalizeMathDelimiters(markdown)));
 	const fragmentHtml = await renderMarkdownToHtmlWithPandoc(normalizedMarkdown, resourcePath, isLatex);
 	const html = buildBrowserHtmlFromPandocFragment(fragmentHtml, style, resourcePath);
 	const hash = createHash("sha256")
