@@ -684,7 +684,7 @@ function renderAnnotationPdfLatex(text: string): string {
 function replaceAnnotationMarkersForPdfInSegment(text: string): string {
 	return replaceInlineAnnotationMarkers(
 		String(text ?? ""),
-		(marker) => {
+		(marker: { body: string }) => {
 			const cleaned = renderAnnotationPdfLatex(marker.body);
 			if (!cleaned) return "";
 			return `\\piannotation{${cleaned}}`;
@@ -694,7 +694,7 @@ function replaceAnnotationMarkersForPdfInSegment(text: string): string {
 
 function highlightAnnotationMarkersForPdf(markdown: string): string {
 	if (!hasMarkdownAnnotationMarkers(markdown)) return String(markdown ?? "");
-	return transformMarkdownOutsideFences(markdown, (segment) => replaceAnnotationMarkersForPdfInSegment(segment));
+	return transformMarkdownOutsideFences(markdown, (segment: string) => replaceAnnotationMarkersForPdfInSegment(segment));
 }
 
 function formatMarkdownImageDestination(rawPath: string): string {
@@ -1304,7 +1304,7 @@ class MarkdownPreviewOverlay {
 
 		const controls: string[] = [];
 		if (this.preview.pages.length > 1) controls.push("←/→ page");
-		controls.push(`${keyHint("selectCancel", "close")}`, "r refresh", "o open browser");
+		controls.push(`${keyHint("tui.select.cancel", "close")}`, "r refresh", "o open browser");
 		this.container.addChild(new Text(this.theme.fg("dim", controls.join(" • ")), 0, 0));
 
 		const page = this.currentPage();
@@ -1950,13 +1950,13 @@ function replaceAnnotationMarkersInDiffTokenLine(line: string, macroName: string
 	const wrapText = (text: string): string => text ? `\\${macroName}{${text}}` : "";
 	const rewritten = replaceInlineAnnotationMarkers(
 		body,
-		(marker) => {
+		(marker: { body: string }) => {
 			const markerText = decodeGeneratedLatexCodeText(normalizeAnnotationText(marker.body));
 			const cleaned = makeHighlightingMathScriptsVerbatimSafe(renderAnnotationPdfLatex(markerText));
 			if (!cleaned) return "";
 			return `\\piannotation{${cleaned}}`;
 		},
-		(segment) => wrapText(segment),
+		(segment: string) => wrapText(segment),
 	);
 
 	return rewritten === body ? line : (rewritten || wrapText(body));
