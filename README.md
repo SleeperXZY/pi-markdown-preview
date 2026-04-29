@@ -34,7 +34,7 @@ Preview adapts to your pi theme. Examples with a custom theme and the built-in d
 - **LaTeX/math support** — renders `$inline$`, `$$display$$`, `\(...\)`, and `\[...\]` math via MathML with selective MathJax fallback for pandoc-unsupported browser/terminal equations, or native LaTeX (PDF)
 - **Syntax highlighting** — fenced code blocks in markdown and standalone code files are rendered with theme-aware syntax colouring via pandoc. Supports 50+ languages including TypeScript, Python, Rust, Go, C/C++, Julia, and more.
 - **Annotation marker highlighting** — inline `[an: ...]` markers are highlighted in terminal/browser/PDF previews as note-only chips (`...`, without the `[an: ]` wrapper) outside code blocks; long notes wrap correctly in PDF instead of running off the page
-- **Theme-aware** — matches your pi theme (dark/light, accent colours, syntax colours)
+- **Theme-aware** — matches your pi theme (dark/light inference, export page/card colours, Markdown colours, accent colours, syntax colours)
 - **Response picker** — select any past assistant response to preview, not just the latest
 - **File preview** — preview arbitrary Markdown files (including `.md`, `.mdx`, `.rmd`, `.qmd`), LaTeX `.tex` files, diff/patch files, or code files (`.py`, `.ts`, `.js`, `.rs`, etc.) from the filesystem. LaTeX files are rendered as documents with full math and sectioning; diff files are rendered with coloured add/remove lines; code files are rendered with syntax highlighting.
 - **Caching** — rendered pages are cached for instant re-display; refresh (`r`) bypasses cache
@@ -74,6 +74,7 @@ pi -e https://github.com/omaclaren/pi-markdown-preview
 | `/preview <path/to/file>` | Preview a Markdown, LaTeX, diff, or code file |
 | `/preview --file <path/to/file>` | Preview a file (explicit flag) |
 | `/preview --browser` | Open preview in default browser |
+| `/preview --font-size 14` | Preview with a custom terminal/browser font size in px (defaults: terminal 16, browser 15) |
 | `/preview-browser` | Shortcut for browser preview |
 | `/preview-browser <path/to/file>` | Open a file preview in browser |
 | `/preview --pdf` | Export to PDF and open |
@@ -82,12 +83,15 @@ pi -e https://github.com/omaclaren/pi-markdown-preview
 | `/preview-clear-cache` | Clear rendered preview cache |
 | `/preview --pick --browser` | Pick a response, open in browser |
 
+Local images are supported. File previews resolve relative image paths against the previewed file’s directory; assistant-response previews resolve them against pi’s current working directory. Absolute paths, `file:`, `http(s):`, and `data:` image URLs also work.
+
 Additional accepted argument aliases:
 - Pick: `-p`, `pick`
 - File: `-f`
 - Browser target: `browser`, `--external`, `external`, `--browser-native`, `native`
 - PDF target: `pdf`
 - Terminal target: `terminal`, `--terminal` (usually unnecessary because terminal is the default)
+- Font size: `--font-size <px>`, `--font-size=<px>`, `--font-size-px <px>`, `--fs <px>` (10–24 px; terminal/browser previews; defaults: terminal 16, browser 15)
 - Help: `--help`, `-h`, `help`
 - Note: `--pick` and `--file` cannot be used together
 
@@ -124,6 +128,12 @@ Set `PUPPETEER_EXECUTABLE_PATH` to override Chromium detection for terminal prev
 
 ```bash
 export PUPPETEER_EXECUTABLE_PATH=/path/to/chromium
+```
+
+Terminal preview uses the known-good fixed screenshot path: 1200px Chromium viewport at device scale `2`. Set `PI_MARKDOWN_PREVIEW_DEVICE_SCALE_FACTOR` only if you want to experiment with screenshot density manually (default: `2`; range: `1`–`2.5`):
+
+```bash
+export PI_MARKDOWN_PREVIEW_DEVICE_SCALE_FACTOR=2
 ```
 
 Set `MERMAID_CLI_PATH` if `mmdc` is not on your `PATH`:

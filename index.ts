@@ -15,7 +15,7 @@ import {
 } from "@mariozechner/pi-tui";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve as resolvePath } from "node:path";
@@ -36,6 +36,13 @@ const MERMAID_PDF_CACHE_DIR = join(CACHE_DIR, "mermaid-pdf");
 const PREVIEW_ANNOTATION_PLACEHOLDER_PREFIX = "PIMDPREVIEWANNOT";
 const ANNOTATION_HELPERS_SOURCE = readFileSync(new URL("./client/annotation-helpers.js", import.meta.url), "utf-8");
 const RENDER_VERSION = "v21";
+const DEFAULT_TERMINAL_PREVIEW_FONT_SIZE_PX = 16;
+const DEFAULT_BROWSER_PREVIEW_FONT_SIZE_PX = 15;
+const MIN_PREVIEW_FONT_SIZE_PX = 10;
+const MAX_PREVIEW_FONT_SIZE_PX = 24;
+const DEFAULT_TERMINAL_DEVICE_SCALE_FACTOR = 2;
+const MIN_TERMINAL_DEVICE_SCALE_FACTOR = 1;
+const MAX_TERMINAL_DEVICE_SCALE_FACTOR = 2.5;
 const VIEWPORT_WIDTH_PX = 1200;
 const PAGE_HEIGHT_PX = 2200;
 const MAX_RENDER_HEIGHT_PX = 66000; // PAGE_HEIGHT_PX * 30
@@ -46,11 +53,27 @@ type PreviewTarget = "terminal" | "browser" | "pdf";
 interface PreviewPalette {
 	bg: string;
 	card: string;
+	panel2: string;
 	border: string;
+	borderMuted: string;
 	text: string;
 	muted: string;
+	accent: string;
+	warn: string;
+	error: string;
+	ok: string;
 	codeBg: string;
 	link: string;
+	mdHeading: string;
+	mdLink: string;
+	mdLinkUrl: string;
+	mdCode: string;
+	mdCodeBlock: string;
+	mdCodeBlockBorder: string;
+	mdQuote: string;
+	mdQuoteBorder: string;
+	mdHr: string;
+	mdListBullet: string;
 	syntaxComment: string;
 	syntaxKeyword: string;
 	syntaxFunction: string;
@@ -101,11 +124,27 @@ interface PreviewAnnotationPlaceholder {
 const DARK_PREVIEW_PALETTE: PreviewPalette = {
 	bg: "#0f1117",
 	card: "#171b24",
-	border: "#2b3343",
+	panel2: "#11161f",
+	border: "#2d3748",
+	borderMuted: "#242b38",
 	text: "#e6edf3",
-	muted: "#9da7b5",
-	codeBg: "#13171e",
-	link: "#58a6ff",
+	muted: "#9aa5b1",
+	accent: "#5ea1ff",
+	warn: "#f9c74f",
+	error: "#ff6b6b",
+	ok: "#73d13d",
+	codeBg: "#11161f",
+	link: "#81a2be",
+	mdHeading: "#f0c674",
+	mdLink: "#81a2be",
+	mdLinkUrl: "#666666",
+	mdCode: "#8abeb7",
+	mdCodeBlock: "#b5bd68",
+	mdCodeBlockBorder: "#808080",
+	mdQuote: "#808080",
+	mdQuoteBorder: "#808080",
+	mdHr: "#808080",
+	mdListBullet: "#8abeb7",
 	syntaxComment: "#6A9955",
 	syntaxKeyword: "#569CD6",
 	syntaxFunction: "#DCDCAA",
@@ -120,11 +159,27 @@ const DARK_PREVIEW_PALETTE: PreviewPalette = {
 const LIGHT_PREVIEW_PALETTE: PreviewPalette = {
 	bg: "#f5f7fb",
 	card: "#ffffff",
+	panel2: "#f8fafc",
 	border: "#d0d7de",
+	borderMuted: "#e0e6ee",
 	text: "#1f2328",
 	muted: "#57606a",
-	codeBg: "#f7f7f7",
-	link: "#0969da",
+	accent: "#0969da",
+	warn: "#9a6700",
+	error: "#cf222e",
+	ok: "#1a7f37",
+	codeBg: "#f8fafc",
+	link: "#547da7",
+	mdHeading: "#9a7326",
+	mdLink: "#547da7",
+	mdLinkUrl: "#767676",
+	mdCode: "#5a8080",
+	mdCodeBlock: "#588458",
+	mdCodeBlockBorder: "#6c6c6c",
+	mdQuote: "#6c6c6c",
+	mdQuoteBorder: "#6c6c6c",
+	mdHr: "#6c6c6c",
+	mdListBullet: "#588458",
 	syntaxComment: "#008000",
 	syntaxKeyword: "#0000FF",
 	syntaxFunction: "#795E26",
@@ -136,9 +191,28 @@ const LIGHT_PREVIEW_PALETTE: PreviewPalette = {
 	syntaxPunctuation: "#000000",
 };
 
-function getThemeMode(theme?: Theme): ThemeMode {
-	const name = (theme?.name ?? "").toLowerCase();
-	return name.includes("light") ? "light" : "dark";
+function inferThemeModeFromName(name: string): ThemeMode | undefined {
+	const lower = name.toLowerCase();
+	if (/\b(light|dawn|day|latte)\b/.test(lower) || lower.includes("-light")) return "light";
+	if (/\b(dark|night|moon|mocha)\b/.test(lower) || lower.includes("-dark")) return "dark";
+	return undefined;
+}
+
+function normalizePreviewFontSizePx(fontSizePx?: number, defaultFontSizePx = DEFAULT_BROWSER_PREVIEW_FONT_SIZE_PX): number {
+	if (!Number.isFinite(fontSizePx)) return defaultFontSizePx;
+	const clamped = Math.max(MIN_PREVIEW_FONT_SIZE_PX, Math.min(MAX_PREVIEW_FONT_SIZE_PX, Number(fontSizePx)));
+	return Math.round(clamped * 10) / 10;
+}
+
+function clampTerminalDeviceScaleFactor(value: number): number {
+	const clamped = Math.max(MIN_TERMINAL_DEVICE_SCALE_FACTOR, Math.min(MAX_TERMINAL_DEVICE_SCALE_FACTOR, value));
+	return Math.round(clamped * 100) / 100;
+}
+
+function getTerminalDeviceScaleFactor(): number {
+	const configured = Number(process.env.PI_MARKDOWN_PREVIEW_DEVICE_SCALE_FACTOR ?? "");
+	if (Number.isFinite(configured) && configured > 0) return clampTerminalDeviceScaleFactor(configured);
+	return DEFAULT_TERMINAL_DEVICE_SCALE_FACTOR;
 }
 
 function toHexByte(value: number): string {
@@ -150,23 +224,29 @@ function rgbToHex(r: number, g: number, b: number): string {
 	return `#${toHexByte(r)}${toHexByte(g)}${toHexByte(b)}`;
 }
 
-function hexToRgb(hex: string): { r: number; g: number; b: number } | undefined {
-	const m = hex.replace("#", "").match(/^([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i);
-	if (!m) return undefined;
-	return { r: parseInt(m[1]!, 16), g: parseInt(m[2]!, 16), b: parseInt(m[3]!, 16) };
-}
-
-function adjustCodeBg(cardHex: string, themeMode: ThemeMode): string {
-	const rgb = hexToRgb(cardHex);
-	if (!rgb) return cardHex;
-	if (themeMode === "dark") {
-		// Slightly darker than card
-		const f = 0.85;
-		return rgbToHex(Math.round(rgb.r * f), Math.round(rgb.g * f), Math.round(rgb.b * f));
+function hexToRgb(color: string): { r: number; g: number; b: number } | undefined {
+	const value = color.trim();
+	const long = value.match(/^#([0-9a-fA-F]{6})$/);
+	if (long) {
+		const hex = long[1]!;
+		return {
+			r: Number.parseInt(hex.slice(0, 2), 16),
+			g: Number.parseInt(hex.slice(2, 4), 16),
+			b: Number.parseInt(hex.slice(4, 6), 16),
+		};
 	}
-	// Light: slightly darker than card (towards gray)
-	const f = 0.97;
-	return rgbToHex(Math.round(rgb.r * f), Math.round(rgb.g * f), Math.round(rgb.b * f));
+
+	const short = value.match(/^#([0-9a-fA-F]{3})$/);
+	if (short) {
+		const hex = short[1]!;
+		return {
+			r: Number.parseInt(hex[0]! + hex[0]!, 16),
+			g: Number.parseInt(hex[1]! + hex[1]!, 16),
+			b: Number.parseInt(hex[2]! + hex[2]!, 16),
+		};
+	}
+
+	return undefined;
 }
 
 function xterm256ToHex(index: number): string {
@@ -232,6 +312,290 @@ function safeThemeColor(getter: () => string): string | undefined {
 	}
 }
 
+function withAlpha(color: string, alpha: number, fallback: string): string {
+	const rgb = hexToRgb(color);
+	if (!rgb) return fallback;
+	const clamped = Math.max(0, Math.min(1, alpha));
+	return `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${clamped.toFixed(2)})`;
+}
+
+function adjustBrightness(color: string, factor: number): string {
+	const rgb = hexToRgb(color);
+	if (!rgb) return color;
+	return rgbToHex(
+		Math.round(rgb.r * factor),
+		Math.round(rgb.g * factor),
+		Math.round(rgb.b * factor),
+	);
+}
+
+function relativeLuminance(color: string): number {
+	const rgb = hexToRgb(color);
+	if (!rgb) return 0;
+	return (0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b) / 255;
+}
+
+function blendColors(a: string, b: string, t: number): string {
+	const rgbA = hexToRgb(a);
+	const rgbB = hexToRgb(b);
+	if (!rgbA || !rgbB) return a;
+	return rgbToHex(
+		Math.round(rgbA.r + (rgbB.r - rgbA.r) * t),
+		Math.round(rgbA.g + (rgbB.g - rgbA.g) * t),
+		Math.round(rgbA.b + (rgbB.b - rgbA.b) * t),
+	);
+}
+
+function wcagRelativeLuminance(color: string): number {
+	const rgb = hexToRgb(color);
+	if (!rgb) return 0;
+	const linear = [rgb.r, rgb.g, rgb.b].map((channel) => {
+		const value = channel / 255;
+		return value <= 0.03928 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+	});
+	return 0.2126 * linear[0]! + 0.7152 * linear[1]! + 0.0722 * linear[2]!;
+}
+
+function contrastRatio(a: string, b: string): number {
+	const lumA = wcagRelativeLuminance(a);
+	const lumB = wcagRelativeLuminance(b);
+	const lighter = Math.max(lumA, lumB);
+	const darker = Math.min(lumA, lumB);
+	return (lighter + 0.05) / (darker + 0.05);
+}
+
+function capBorderContrast(color: string, surface: string, maxContrast: number): string {
+	if (!hexToRgb(color) || !hexToRgb(surface)) return color;
+	if (contrastRatio(color, surface) <= maxContrast) return color;
+
+	let low = 0;
+	let high = 1;
+	let result = color;
+	for (let i = 0; i < 12; i += 1) {
+		const mid = (low + high) / 2;
+		const candidate = blendColors(color, surface, mid);
+		if (contrastRatio(candidate, surface) > maxContrast) {
+			low = mid;
+		} else {
+			result = candidate;
+			high = mid;
+		}
+	}
+	return result;
+}
+
+function deriveCanvasColors(
+	baseColor: string,
+	themeMode: ThemeMode,
+): { pageBg: string; cardBg: string; panel2: string } {
+	if (themeMode === "dark") {
+		const pageBg = adjustBrightness(baseColor, 0.50);
+		const cardBg = adjustBrightness(baseColor, 0.60);
+		return {
+			pageBg,
+			cardBg,
+			panel2: adjustBrightness(baseColor, 0.72),
+		};
+	}
+	const lum = relativeLuminance(baseColor);
+	const lighten = (c: string, amount: number): string => {
+		const rgb = hexToRgb(c);
+		if (!rgb) return c;
+		return rgbToHex(
+			Math.round(rgb.r + (255 - rgb.r) * amount),
+			Math.round(rgb.g + (255 - rgb.g) * amount),
+			Math.round(rgb.b + (255 - rgb.b) * amount),
+		);
+	};
+	if (lum > 0.92) {
+		return { pageBg: baseColor, cardBg: "#ffffff", panel2: lighten(baseColor, 0.3) };
+	}
+	return {
+		pageBg: lighten(baseColor, 0.6),
+		cardBg: lighten(baseColor, 0.93),
+		panel2: lighten(baseColor, 0.45),
+	};
+}
+
+function adjustCodeBg(cardHex: string, themeMode: ThemeMode): string {
+	const rgb = hexToRgb(cardHex);
+	if (!rgb) return cardHex;
+	if (themeMode === "dark") {
+		const f = 0.85;
+		return rgbToHex(Math.round(rgb.r * f), Math.round(rgb.g * f), Math.round(rgb.b * f));
+	}
+	const f = 0.97;
+	return rgbToHex(Math.round(rgb.r * f), Math.round(rgb.g * f), Math.round(rgb.b * f));
+}
+
+interface ThemeExportPalette {
+	pageBg?: string;
+	cardBg?: string;
+	infoBg?: string;
+}
+
+interface ThemeSourceJson {
+	name?: string;
+	vars?: Record<string, string | number>;
+	colors?: Record<string, string | number>;
+	export?: { pageBg?: string | number; cardBg?: string | number; infoBg?: string | number };
+}
+
+const themeSourceJsonCache = new Map<string, { mtimeMs: number; json: ThemeSourceJson | null }>();
+
+function resolveThemeExportValue(
+	value: string | number | undefined,
+	vars: Record<string, string | number>,
+	seen: Set<string> = new Set(),
+): string | undefined {
+	if (value == null) return undefined;
+	if (typeof value === "number") return xterm256ToHex(value);
+
+	const token = value.trim();
+	if (!token) return undefined;
+	if (token.startsWith("#")) return token;
+
+	const varKey = token.startsWith("$") ? token.slice(1) : token;
+	if (!varKey || seen.has(varKey)) return token;
+
+	const referenced = vars[varKey];
+	if (referenced == null) return token;
+
+	seen.add(varKey);
+	return resolveThemeExportValue(referenced, vars, seen) ?? token;
+}
+
+function isCssColorValue(value: string | undefined): value is string {
+	if (!value) return false;
+	const trimmed = value.trim();
+	return /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(trimmed) || /^rgba?\(/i.test(trimmed);
+}
+
+function normalizeResolvedThemeColor(value: string | undefined): string | undefined {
+	if (!isCssColorValue(value)) return undefined;
+	return value.trim();
+}
+
+function readThemeSourceJson(theme?: Theme): ThemeSourceJson | undefined {
+	const sourcePath = theme?.sourcePath?.trim();
+	if (!sourcePath) return undefined;
+
+	try {
+		const mtimeMs = statSync(sourcePath).mtimeMs;
+		const cached = themeSourceJsonCache.get(sourcePath);
+		if (cached && cached.mtimeMs === mtimeMs) return cached.json ?? undefined;
+
+		const raw = readFileSync(sourcePath, "utf-8");
+		const parsed = JSON.parse(raw) as ThemeSourceJson;
+		themeSourceJsonCache.set(sourcePath, { mtimeMs, json: parsed });
+		return parsed;
+	} catch {
+		themeSourceJsonCache.set(sourcePath, { mtimeMs: -1, json: null });
+		return undefined;
+	}
+}
+
+function resolveThemeJsonValue(
+	value: string | number | undefined,
+	vars: Record<string, string | number>,
+): string | undefined {
+	return normalizeResolvedThemeColor(resolveThemeExportValue(value, vars));
+}
+
+function readThemeExportPalette(theme?: Theme): ThemeExportPalette | undefined {
+	const parsed = readThemeSourceJson(theme);
+	if (!parsed) return undefined;
+	const vars = parsed.vars ?? {};
+	const exportSection = parsed.export ?? {};
+	const resolved: ThemeExportPalette = {
+		pageBg: resolveThemeJsonValue(exportSection.pageBg, vars),
+		cardBg: resolveThemeJsonValue(exportSection.cardBg, vars),
+		infoBg: resolveThemeJsonValue(exportSection.infoBg, vars),
+	};
+	return resolved.pageBg || resolved.cardBg || resolved.infoBg ? resolved : undefined;
+}
+
+function readThemeColorToken(theme: Theme | undefined, token: string): string | undefined {
+	const parsed = readThemeSourceJson(theme);
+	if (!parsed) return undefined;
+	return resolveThemeJsonValue(parsed.colors?.[token], parsed.vars ?? {});
+}
+
+function readThemeVarColor(theme: Theme | undefined, keys: string[]): string | undefined {
+	const parsed = readThemeSourceJson(theme);
+	if (!parsed) return undefined;
+	const vars = parsed.vars ?? {};
+	for (const key of keys) {
+		const color = resolveThemeJsonValue(vars[key], vars);
+		if (color) return color;
+	}
+	return undefined;
+}
+
+function readThemeAnyColor(theme: Theme | undefined, keys: string[]): string | undefined {
+	const parsed = readThemeSourceJson(theme);
+	if (!parsed) return undefined;
+	const vars = parsed.vars ?? {};
+	for (const key of keys) {
+		const color = resolveThemeJsonValue(parsed.colors?.[key], vars);
+		if (color) return color;
+	}
+	return undefined;
+}
+
+function inferThemeModeFromColor(color: string | undefined): ThemeMode | undefined {
+	if (!color || !hexToRgb(color)) return undefined;
+	return relativeLuminance(color) >= 0.58 ? "light" : "dark";
+}
+
+function inferThemeModeFromColorCandidates(...colors: Array<string | undefined>): ThemeMode | undefined {
+	for (const color of colors) {
+		const inferred = inferThemeModeFromColor(color);
+		if (inferred) return inferred;
+	}
+	return undefined;
+}
+
+function getThemeMode(theme?: Theme): ThemeMode {
+	const exported = readThemeExportPalette(theme);
+	const inferredFromExport = inferThemeModeFromColorCandidates(exported?.pageBg, exported?.cardBg);
+	if (inferredFromExport) return inferredFromExport;
+
+	const inferredFromSurface = inferThemeModeFromColorCandidates(
+		inferThemeSurfaceColor(theme, "page"),
+		inferThemeSurfaceColor(theme, "card"),
+		readThemeColorToken(theme, "userMessageBg"),
+		readThemeColorToken(theme, "customMessageBg"),
+		readThemeColorToken(theme, "toolPendingBg"),
+	);
+	if (inferredFromSurface) return inferredFromSurface;
+
+	const inferredFromName = inferThemeModeFromName(theme?.name ?? "");
+	if (inferredFromName) return inferredFromName;
+
+	return "dark";
+}
+
+function inferThemeTextColor(theme: Theme | undefined, themeMode: ThemeMode): string | undefined {
+	return readThemeAnyColor(theme, ["text", "userMessageText", "customMessageText", "mdCodeBlock"])
+		?? readThemeVarColor(
+			theme,
+			themeMode === "light"
+				? ["text", "fg", "foreground", "textDark1", "fg0", "fg1", "nord0"]
+				: ["text", "fg", "foreground", "fg0", "fg1", "subtext1", "subtext0", "nord4", "gray3"],
+		);
+}
+
+function inferThemeSurfaceColor(theme: Theme | undefined, role: "page" | "card" | "panel2"): string | undefined {
+	if (role === "page") {
+		return readThemeVarColor(theme, ["pageBg", "bg", "base", "background", "mantle", "bg_dark", "bg0", "nord0"]);
+	}
+	if (role === "card") {
+		return readThemeVarColor(theme, ["cardBg", "surface", "base", "bg", "bg1", "nord1"]);
+	}
+	return readThemeVarColor(theme, ["infoBg", "surfaceAlt", "surface0", "overlay", "bg_hl", "bg2", "nord2"]);
+}
+
 function getPreviewStyle(theme?: Theme): PreviewStyle {
 	const themeMode = getThemeMode(theme);
 	const fallback = themeMode === "dark" ? DARK_PREVIEW_PALETTE : LIGHT_PREVIEW_PALETTE;
@@ -240,56 +604,92 @@ function getPreviewStyle(theme?: Theme): PreviewStyle {
 		return {
 			themeMode,
 			palette: fallback,
-			cacheKey: `${themeMode}|fallback`,
+			cacheKey: [themeMode, ...Object.values(fallback)].join("|"),
 		};
 	}
 
-	const card = safeThemeColor(() => theme.getBgAnsi("toolPendingBg")) ?? fallback.card;
+	const exported = readThemeExportPalette(theme);
+	const accent =
+		safeThemeColor(() => theme.getFgAnsi("mdLink"))
+		?? safeThemeColor(() => theme.getFgAnsi("accent"))
+		?? readThemeColorToken(theme, "mdLink")
+		?? readThemeColorToken(theme, "accent")
+		?? fallback.accent;
+	const warn = safeThemeColor(() => theme.getFgAnsi("warning")) ?? readThemeColorToken(theme, "warning") ?? fallback.warn;
+	const error = safeThemeColor(() => theme.getFgAnsi("error")) ?? readThemeColorToken(theme, "error") ?? fallback.error;
+	const ok = safeThemeColor(() => theme.getFgAnsi("success")) ?? readThemeColorToken(theme, "success") ?? fallback.ok;
+	const text = safeThemeColor(() => theme.getFgAnsi("text")) ?? inferThemeTextColor(theme, themeMode) ?? fallback.text;
+
+	const surfaceBase =
+		safeThemeColor(() => theme.getBgAnsi("userMessageBg"))
+		?? safeThemeColor(() => theme.getBgAnsi("customMessageBg"))
+		?? readThemeColorToken(theme, "userMessageBg")
+		?? readThemeColorToken(theme, "customMessageBg");
+	const derived = surfaceBase ? deriveCanvasColors(surfaceBase, themeMode) : undefined;
+	const themePageBg = inferThemeSurfaceColor(theme, "page");
+	const themeCardBg = inferThemeSurfaceColor(theme, "card");
+	const themePanel2 = inferThemeSurfaceColor(theme, "panel2");
+
+	const card =
+		exported?.cardBg
+		?? themeCardBg
+		?? derived?.cardBg
+		?? safeThemeColor(() => theme.getBgAnsi("toolPendingBg"))
+		?? readThemeColorToken(theme, "toolPendingBg")
+		?? fallback.card;
+	const panel2 =
+		themePanel2
+		?? derived?.panel2
+		?? safeThemeColor(() => theme.getBgAnsi("selectedBg"))
+		?? readThemeColorToken(theme, "selectedBg")
+		?? exported?.infoBg
+		?? adjustCodeBg(card, themeMode)
+		?? fallback.panel2;
+	const mdLink = safeThemeColor(() => theme.getFgAnsi("mdLink")) ?? readThemeColorToken(theme, "mdLink") ?? accent;
 
 	const palette: PreviewPalette = {
-		bg: safeThemeColor(() => theme.getBgAnsi("customMessageBg")) ?? fallback.bg,
+		bg:
+			exported?.pageBg
+			?? themePageBg
+			?? derived?.pageBg
+			?? fallback.bg,
 		card,
-		border: safeThemeColor(() => theme.getFgAnsi("border")) ?? fallback.border,
-		text: safeThemeColor(() => theme.getFgAnsi("text")) ?? fallback.text,
-		muted: safeThemeColor(() => theme.getFgAnsi("muted")) ?? fallback.muted,
-		codeBg: adjustCodeBg(card, themeMode),
-		link:
-			safeThemeColor(() => theme.getFgAnsi("mdLink")) ?? safeThemeColor(() => theme.getFgAnsi("accent")) ?? fallback.link,
-		syntaxComment: safeThemeColor(() => theme.getFgAnsi("syntaxComment")) ?? fallback.syntaxComment,
-		syntaxKeyword: safeThemeColor(() => theme.getFgAnsi("syntaxKeyword")) ?? fallback.syntaxKeyword,
-		syntaxFunction: safeThemeColor(() => theme.getFgAnsi("syntaxFunction")) ?? fallback.syntaxFunction,
-		syntaxVariable: safeThemeColor(() => theme.getFgAnsi("syntaxVariable")) ?? fallback.syntaxVariable,
-		syntaxString: safeThemeColor(() => theme.getFgAnsi("syntaxString")) ?? fallback.syntaxString,
-		syntaxNumber: safeThemeColor(() => theme.getFgAnsi("syntaxNumber")) ?? fallback.syntaxNumber,
-		syntaxType: safeThemeColor(() => theme.getFgAnsi("syntaxType")) ?? fallback.syntaxType,
-		syntaxOperator: safeThemeColor(() => theme.getFgAnsi("syntaxOperator")) ?? fallback.syntaxOperator,
-		syntaxPunctuation: safeThemeColor(() => theme.getFgAnsi("syntaxPunctuation")) ?? fallback.syntaxPunctuation,
+		panel2,
+		border: safeThemeColor(() => theme.getFgAnsi("border")) ?? readThemeColorToken(theme, "border") ?? fallback.border,
+		borderMuted: safeThemeColor(() => theme.getFgAnsi("borderMuted")) ?? readThemeColorToken(theme, "borderMuted") ?? fallback.borderMuted,
+		text,
+		muted: safeThemeColor(() => theme.getFgAnsi("muted")) ?? readThemeColorToken(theme, "muted") ?? fallback.muted,
+		accent,
+		warn,
+		error,
+		ok,
+		codeBg: panel2,
+		link: mdLink,
+		mdHeading: safeThemeColor(() => theme.getFgAnsi("mdHeading")) ?? readThemeColorToken(theme, "mdHeading") ?? fallback.mdHeading,
+		mdLink,
+		mdLinkUrl: safeThemeColor(() => theme.getFgAnsi("mdLinkUrl")) ?? readThemeColorToken(theme, "mdLinkUrl") ?? fallback.mdLinkUrl,
+		mdCode: safeThemeColor(() => theme.getFgAnsi("mdCode")) ?? readThemeColorToken(theme, "mdCode") ?? fallback.mdCode,
+		mdCodeBlock: safeThemeColor(() => theme.getFgAnsi("mdCodeBlock")) ?? readThemeColorToken(theme, "mdCodeBlock") ?? text,
+		mdCodeBlockBorder: safeThemeColor(() => theme.getFgAnsi("mdCodeBlockBorder")) ?? readThemeColorToken(theme, "mdCodeBlockBorder") ?? fallback.mdCodeBlockBorder,
+		mdQuote: safeThemeColor(() => theme.getFgAnsi("mdQuote")) ?? readThemeColorToken(theme, "mdQuote") ?? fallback.mdQuote,
+		mdQuoteBorder: safeThemeColor(() => theme.getFgAnsi("mdQuoteBorder")) ?? readThemeColorToken(theme, "mdQuoteBorder") ?? fallback.mdQuoteBorder,
+		mdHr: safeThemeColor(() => theme.getFgAnsi("mdHr")) ?? readThemeColorToken(theme, "mdHr") ?? fallback.mdHr,
+		mdListBullet: safeThemeColor(() => theme.getFgAnsi("mdListBullet")) ?? readThemeColorToken(theme, "mdListBullet") ?? fallback.mdListBullet,
+		syntaxComment: safeThemeColor(() => theme.getFgAnsi("syntaxComment")) ?? readThemeColorToken(theme, "syntaxComment") ?? fallback.syntaxComment,
+		syntaxKeyword: safeThemeColor(() => theme.getFgAnsi("syntaxKeyword")) ?? readThemeColorToken(theme, "syntaxKeyword") ?? fallback.syntaxKeyword,
+		syntaxFunction: safeThemeColor(() => theme.getFgAnsi("syntaxFunction")) ?? readThemeColorToken(theme, "syntaxFunction") ?? fallback.syntaxFunction,
+		syntaxVariable: safeThemeColor(() => theme.getFgAnsi("syntaxVariable")) ?? readThemeColorToken(theme, "syntaxVariable") ?? fallback.syntaxVariable,
+		syntaxString: safeThemeColor(() => theme.getFgAnsi("syntaxString")) ?? readThemeColorToken(theme, "syntaxString") ?? fallback.syntaxString,
+		syntaxNumber: safeThemeColor(() => theme.getFgAnsi("syntaxNumber")) ?? readThemeColorToken(theme, "syntaxNumber") ?? fallback.syntaxNumber,
+		syntaxType: safeThemeColor(() => theme.getFgAnsi("syntaxType")) ?? readThemeColorToken(theme, "syntaxType") ?? fallback.syntaxType,
+		syntaxOperator: safeThemeColor(() => theme.getFgAnsi("syntaxOperator")) ?? readThemeColorToken(theme, "syntaxOperator") ?? fallback.syntaxOperator,
+		syntaxPunctuation: safeThemeColor(() => theme.getFgAnsi("syntaxPunctuation")) ?? readThemeColorToken(theme, "syntaxPunctuation") ?? fallback.syntaxPunctuation,
 	};
-
-	const cacheKey = [
-		themeMode,
-		palette.bg,
-		palette.card,
-		palette.border,
-		palette.text,
-		palette.muted,
-		palette.codeBg,
-		palette.link,
-		palette.syntaxComment,
-		palette.syntaxKeyword,
-		palette.syntaxFunction,
-		palette.syntaxVariable,
-		palette.syntaxString,
-		palette.syntaxNumber,
-		palette.syntaxType,
-		palette.syntaxOperator,
-		palette.syntaxPunctuation,
-	].join("|");
 
 	return {
 		themeMode,
 		palette,
-		cacheKey,
+		cacheKey: [themeMode, ...Object.values(palette)].join("|"),
 	};
 }
 
@@ -1089,9 +1489,11 @@ function prepareBrowserPreviewMarkdown(markdown: string, isLatex?: boolean): {
 	};
 }
 
-async function renderPreview(markdown: string, style: PreviewStyle, signal?: AbortSignal, resourcePath?: string, skipCache?: boolean, isLatex?: boolean): Promise<RenderPreviewResult> {
+async function renderPreview(markdown: string, style: PreviewStyle, signal?: AbortSignal, resourcePath?: string, skipCache?: boolean, isLatex?: boolean, fontSizePx?: number): Promise<RenderPreviewResult> {
 	const { normalizedMarkdown, pandocMarkdown, annotationPlaceholders } = prepareBrowserPreviewMarkdown(markdown, isLatex);
-	const cacheKey = buildRenderCacheKey(style.cacheKey, resourcePath, isLatex);
+	const previewFontSizePx = normalizePreviewFontSizePx(fontSizePx, DEFAULT_TERMINAL_PREVIEW_FONT_SIZE_PX);
+	const deviceScaleFactor = getTerminalDeviceScaleFactor();
+	const cacheKey = buildRenderCacheKey(`${style.cacheKey}|fontSize=${previewFontSizePx}|scale=${deviceScaleFactor}`, resourcePath, isLatex);
 
 	// Check cache for the full render (keyed on full markdown content).
 	const cached = skipCache ? undefined : await readCachedPage(normalizedMarkdown, cacheKey);
@@ -1105,7 +1507,7 @@ async function renderPreview(markdown: string, style: PreviewStyle, signal?: Abo
 			const pageCached = i === 0 ? cached : await readCachedPage(pageKey, cacheKey);
 			if (!pageCached) {
 				// Cache is incomplete; re-render.
-				return renderPreview(markdown, style, signal, resourcePath, true, isLatex);
+				return renderPreview(markdown, style, signal, resourcePath, true, isLatex, previewFontSizePx);
 			}
 			pages.push({
 				base64Png: pageCached.buffer.toString("base64"),
@@ -1120,7 +1522,7 @@ async function renderPreview(markdown: string, style: PreviewStyle, signal?: Abo
 	await mkdir(CACHE_DIR, { recursive: true });
 
 	const fragmentHtml = await renderMarkdownToHtmlWithPandoc(pandocMarkdown, resourcePath, isLatex);
-	const html = buildBrowserHtmlFromPandocFragment(fragmentHtml, style, resourcePath, annotationPlaceholders);
+	const html = buildBrowserHtmlFromPandocFragment(fragmentHtml, style, resourcePath, annotationPlaceholders, previewFontSizePx);
 
 	let browser: puppeteer.Browser | undefined;
 	let browserPage: puppeteer.Page | undefined;
@@ -1148,7 +1550,7 @@ async function renderPreview(markdown: string, style: PreviewStyle, signal?: Abo
 			await browserPage!.setViewport({
 				width: VIEWPORT_WIDTH_PX,
 				height,
-				deviceScaleFactor: 2,
+				deviceScaleFactor,
 			});
 			if (!tempHtmlPath) {
 				tempHtmlPath = join(CACHE_DIR, `_render_tmp_${Date.now()}.html`);
@@ -1416,7 +1818,7 @@ class MarkdownPreviewOverlay {
 	}
 }
 
-async function renderWithLoader(ctx: ExtensionCommandContext, markdown: string, resourcePath?: string, isLatex?: boolean): Promise<RenderWithLoaderResult | null> {
+async function renderWithLoader(ctx: ExtensionCommandContext, markdown: string, resourcePath?: string, isLatex?: boolean, fontSizePx?: number): Promise<RenderWithLoaderResult | null> {
 	type LoaderResult = { ok: true; preview: RenderPreviewResult } | { ok: false; error: string } | { ok: false; cancelled: true };
 
 	const result = await ctx.ui.custom<LoaderResult>((tui, theme, _kb, done) => {
@@ -1433,7 +1835,7 @@ async function renderWithLoader(ctx: ExtensionCommandContext, markdown: string, 
 		void (async () => {
 			try {
 				const style = getPreviewStyle(ctx.ui.theme);
-				const preview = await renderPreview(markdown, style, loader.signal, resourcePath, undefined, isLatex);
+				const preview = await renderPreview(markdown, style, loader.signal, resourcePath, undefined, isLatex, fontSizePx);
 				if (loader.signal.aborted) {
 					resolve({ ok: false, cancelled: true });
 					return;
@@ -1451,7 +1853,7 @@ async function renderWithLoader(ctx: ExtensionCommandContext, markdown: string, 
 	if (!result) {
 		try {
 			const style = getPreviewStyle(ctx.ui.theme);
-			const preview = await renderPreview(markdown, style, undefined, resourcePath, undefined, isLatex);
+			const preview = await renderPreview(markdown, style, undefined, resourcePath, undefined, isLatex, fontSizePx);
 			return { preview, supportsCustomUi: false };
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -1541,14 +1943,15 @@ async function pickAssistantMessage(ctx: ExtensionCommandContext): Promise<strin
 	return selected ? selected.markdown : null;
 }
 
-async function openPreview(ctx: ExtensionCommandContext, markdownOverride?: string, resourcePath?: string, isLatex?: boolean): Promise<void> {
+async function openPreview(ctx: ExtensionCommandContext, markdownOverride?: string, resourcePath?: string, isLatex?: boolean, fontSizePx?: number): Promise<void> {
 	const markdown = markdownOverride ?? getLastAssistantMarkdown(ctx);
 	if (!markdown) {
 		ctx.ui.notify("No assistant markdown found in the current branch.", "warning");
 		return;
 	}
 
-	const rendered = await renderWithLoader(ctx, markdown, resourcePath, isLatex);
+	const previewFontSizePx = normalizePreviewFontSizePx(fontSizePx, DEFAULT_TERMINAL_PREVIEW_FONT_SIZE_PX);
+	const rendered = await renderWithLoader(ctx, markdown, resourcePath, isLatex, previewFontSizePx);
 	if (!rendered) return;
 
 	const { preview: initialPreview, supportsCustomUi } = rendered;
@@ -1573,11 +1976,11 @@ async function openPreview(ctx: ExtensionCommandContext, markdownOverride?: stri
 			done,
 			async () => {
 				const style = getPreviewStyle(ctx.ui.theme);
-				const refreshed = await renderPreview(markdown, style, undefined, resourcePath, true, isLatex);
+				const refreshed = await renderPreview(markdown, style, undefined, resourcePath, true, isLatex, previewFontSizePx);
 				return refreshed;
 			},
 			async () => {
-				await openPreviewInBrowser(ctx, markdown, resourcePath, isLatex);
+				await openPreviewInBrowser(ctx, markdown, resourcePath, isLatex, previewFontSizePx);
 			},
 		),
 	);
@@ -2308,13 +2711,123 @@ async function exportPdf(ctx: ExtensionCommandContext, markdownOverride?: string
 	await openFileInDefaultBrowser(pdfPath);
 }
 
+function buildPreviewCssVars(style: PreviewStyle, fontSizePx?: number): Record<string, string> {
+	const palette = style.palette;
+	const previewFontSizePx = normalizePreviewFontSizePx(fontSizePx);
+	const rawBorderSubtle = blendColors(palette.borderMuted, palette.card, style.themeMode === "light" ? 0.58 : 0.48);
+	const rawPanelBorder = blendColors(palette.borderMuted, palette.card, style.themeMode === "light" ? 0.42 : 0.36);
+	const borderSubtle = capBorderContrast(rawBorderSubtle, palette.card, style.themeMode === "light" ? 1.10 : 1.12);
+	const panelBorder = capBorderContrast(rawPanelBorder, palette.card, style.themeMode === "light" ? 1.15 : 1.18);
+	const blockquoteBg = withAlpha(
+		palette.mdQuoteBorder,
+		style.themeMode === "light" ? 0.10 : 0.16,
+		style.themeMode === "light" ? "rgba(15, 23, 42, 0.04)" : "rgba(255, 255, 255, 0.05)",
+	);
+	const tableAltBg = withAlpha(
+		palette.mdCodeBlockBorder,
+		style.themeMode === "light" ? 0.10 : 0.14,
+		style.themeMode === "light" ? "rgba(15, 23, 42, 0.03)" : "rgba(255, 255, 255, 0.04)",
+	);
+	const inlineCodeBg = withAlpha(
+		palette.mdCodeBlockBorder,
+		style.themeMode === "light" ? 0.13 : 0.18,
+		style.themeMode === "light" ? "rgba(15, 23, 42, 0.06)" : "rgba(255, 255, 255, 0.07)",
+	);
+	const rawCodeBlockBorder = blendColors(palette.mdCodeBlockBorder, palette.panel2, style.themeMode === "light" ? 0.62 : 0.72);
+	const codeBlockBorder = capBorderContrast(rawCodeBlockBorder, palette.panel2, style.themeMode === "light" ? 1.16 : 1.18);
+	const diffAddedBg = withAlpha(palette.ok, style.themeMode === "light" ? 0.10 : 0.14, "rgba(46, 160, 67, 0.12)");
+	const diffRemovedBg = withAlpha(palette.error, style.themeMode === "light" ? 0.10 : 0.14, "rgba(248, 81, 73, 0.12)");
+
+	return {
+		"color-scheme": style.themeMode,
+		"--preview-font-size": `${previewFontSizePx}px`,
+		"--bg": palette.bg,
+		"--card": palette.card,
+		"--panel-2": palette.panel2,
+		"--border": palette.border,
+		"--border-muted": palette.borderMuted,
+		"--border-subtle": borderSubtle,
+		"--panel-border": panelBorder,
+		"--text": palette.text,
+		"--muted": palette.muted,
+		"--accent": palette.accent,
+		"--warn": palette.warn,
+		"--error": palette.error,
+		"--ok": palette.ok,
+		"--code-bg": palette.codeBg,
+		"--link": palette.link,
+		"--md-heading": palette.mdHeading,
+		"--md-link": palette.mdLink,
+		"--md-link-url": palette.mdLinkUrl,
+		"--md-code": palette.mdCode,
+		"--md-codeblock": palette.mdCodeBlock,
+		"--md-codeblock-border": codeBlockBorder,
+		"--md-quote": palette.mdQuote,
+		"--md-quote-border": palette.mdQuoteBorder,
+		"--md-hr": palette.mdHr,
+		"--md-list-bullet": palette.mdListBullet,
+		"--syntax-keyword": palette.syntaxKeyword,
+		"--syntax-function": palette.syntaxFunction,
+		"--syntax-variable": palette.syntaxVariable,
+		"--syntax-string": palette.syntaxString,
+		"--syntax-number": palette.syntaxNumber,
+		"--syntax-type": palette.syntaxType,
+		"--syntax-comment": palette.syntaxComment,
+		"--syntax-operator": palette.syntaxOperator,
+		"--syntax-punctuation": palette.syntaxPunctuation,
+		"--syntax-error": palette.error,
+		"--annotation-bg": withAlpha(palette.accent, style.themeMode === "light" ? 0.13 : 0.25, style.themeMode === "light" ? "rgba(9, 105, 218, 0.14)" : "rgba(88, 166, 255, 0.22)"),
+		"--annotation-border": withAlpha(palette.accent, style.themeMode === "light" ? 0.45 : 0.65, style.themeMode === "light" ? "rgba(9, 105, 218, 0.40)" : "rgba(88, 166, 255, 0.62)"),
+		"--annotation-text": palette.text,
+		"--blockquote-bg": blockquoteBg,
+		"--inline-code-bg": inlineCodeBg,
+		"--table-alt-bg": tableAltBg,
+		"--md-table-border": borderSubtle,
+		"--diff-add-bg": diffAddedBg,
+		"--diff-add-text": palette.ok,
+		"--diff-del-bg": diffRemovedBg,
+		"--diff-del-text": palette.error,
+		"--diff-meta-text": palette.muted,
+		"--diff-header-bg": withAlpha(palette.accent, style.themeMode === "light" ? 0.08 : 0.10, style.themeMode === "light" ? "rgba(9, 105, 218, 0.08)" : "rgba(88, 166, 255, 0.10)"),
+		"--diff-header-text": palette.accent,
+		"--diff-hunk-bg": withAlpha(palette.accent, style.themeMode === "light" ? 0.12 : 0.16, style.themeMode === "light" ? "rgba(9, 105, 218, 0.12)" : "rgba(88, 166, 255, 0.16)"),
+		"--diff-hunk-text": palette.accent,
+	};
+}
+
 function buildBrowserHtmlFromPandocFragment(
 	fragmentHtml: string,
 	style: PreviewStyle,
 	resourcePath?: string,
 	annotationPlaceholders: PreviewAnnotationPlaceholder[] = [],
+	fontSizePx?: number,
 ): string {
 	const palette = style.palette;
+	const cssVarsBlock = Object.entries(buildPreviewCssVars(style, fontSizePx)).map(([key, value]) => `  ${key}: ${value};`).join("\n");
+	const mermaidConfig = {
+		startOnLoad: false,
+		theme: "base",
+		themeVariables: {
+			background: palette.bg,
+			primaryColor: palette.panel2,
+			primaryTextColor: palette.text,
+			primaryBorderColor: palette.mdCodeBlockBorder,
+			secondaryColor: palette.card,
+			secondaryTextColor: palette.text,
+			secondaryBorderColor: palette.mdCodeBlockBorder,
+			tertiaryColor: palette.card,
+			tertiaryTextColor: palette.text,
+			tertiaryBorderColor: palette.mdCodeBlockBorder,
+			lineColor: palette.mdQuote,
+			textColor: palette.text,
+			edgeLabelBackground: palette.panel2,
+			nodeBorder: palette.mdCodeBlockBorder,
+			clusterBkg: palette.card,
+			clusterBorder: palette.mdCodeBlockBorder,
+			titleColor: palette.mdHeading,
+		},
+	};
+	const mermaidConfigJson = JSON.stringify(mermaidConfig).replace(/</g, "\\u003c");
 	const baseTag = resourcePath ? `\n<base href="${pathToFileURL(resourcePath + "/").href}" />` : "";
 	const annotationHelpersScript = ANNOTATION_HELPERS_SOURCE.replace(/<\/script/gi, "<\\/script");
 	const annotationPlaceholdersJson = JSON.stringify(annotationPlaceholders).replace(/</g, "\\u003c");
@@ -2326,35 +2839,7 @@ function buildBrowserHtmlFromPandocFragment(
 <title>Markdown Preview</title>
 <style>
 :root {
-  --bg: ${palette.bg};
-  --card: ${palette.card};
-  --border: ${palette.border};
-  --text: ${palette.text};
-  --muted: ${palette.muted};
-  --code-bg: ${palette.codeBg};
-  --link: ${palette.link};
-  --syntax-keyword: ${palette.syntaxKeyword};
-  --syntax-function: ${palette.syntaxFunction};
-  --syntax-variable: ${palette.syntaxVariable};
-  --syntax-string: ${palette.syntaxString};
-  --syntax-number: ${palette.syntaxNumber};
-  --syntax-type: ${palette.syntaxType};
-  --syntax-comment: ${palette.syntaxComment};
-  --syntax-operator: ${palette.syntaxOperator};
-  --syntax-punctuation: ${palette.syntaxPunctuation};
-  --syntax-error: ${style.themeMode === "dark" ? "#ff7b72" : "#cf222e"};
-  --annotation-bg: ${style.themeMode === "dark" ? "rgba(88, 166, 255, 0.22)" : "rgba(9, 105, 218, 0.14)"};
-  --annotation-border: ${style.themeMode === "dark" ? "rgba(88, 166, 255, 0.62)" : "rgba(9, 105, 218, 0.40)"};
-  --annotation-text: ${style.themeMode === "dark" ? "#e6edf3" : "#1f2328"};
-  --diff-add-bg: ${style.themeMode === "dark" ? "rgba(46, 160, 67, 0.18)" : "rgba(26, 127, 55, 0.12)"};
-  --diff-add-text: ${style.themeMode === "dark" ? "#3fb950" : "#1a7f37"};
-  --diff-del-bg: ${style.themeMode === "dark" ? "rgba(248, 81, 73, 0.18)" : "rgba(207, 34, 46, 0.12)"};
-  --diff-del-text: ${style.themeMode === "dark" ? "#ff7b72" : "#cf222e"};
-  --diff-meta-text: ${style.themeMode === "dark" ? "#9da7b5" : "#57606a"};
-  --diff-header-bg: ${style.themeMode === "dark" ? "rgba(88, 166, 255, 0.10)" : "rgba(9, 105, 218, 0.08)"};
-  --diff-header-text: ${style.themeMode === "dark" ? "#79c0ff" : "#0969da"};
-  --diff-hunk-bg: ${style.themeMode === "dark" ? "rgba(88, 166, 255, 0.16)" : "rgba(9, 105, 218, 0.12)"};
-  --diff-hunk-text: ${style.themeMode === "dark" ? "#79c0ff" : "#0969da"};
+${cssVarsBlock}
 }
 * { box-sizing: border-box; }
 html, body {
@@ -2372,35 +2857,41 @@ body {
   width: min(1100px, 100%);
   margin: 0 auto;
   background: var(--card);
-  border: 1px solid var(--border);
+  border: 1px solid var(--panel-border);
   border-radius: 10px;
   padding: 24px 28px;
   overflow-wrap: anywhere;
   line-height: 1.58;
-  font-size: 16px;
+  font-size: var(--preview-font-size);
 }
 #preview-root h1, #preview-root h2, #preview-root h3, #preview-root h4, #preview-root h5, #preview-root h6 {
   margin-top: 1.2em;
   margin-bottom: 0.5em;
   line-height: 1.25;
+  letter-spacing: -0.01em;
+  color: var(--md-heading);
 }
-#preview-root h1 { font-size: 2em; border-bottom: 1px solid var(--border); padding-bottom: 0.3em; }
-#preview-root h2 { font-size: 1.5em; border-bottom: 1px solid var(--border); padding-bottom: 0.25em; }
+#preview-root h1 { font-size: 1.6em; border-bottom: 0; padding-bottom: 0; }
+#preview-root h2 { font-size: 1.25em; border-bottom: 0; padding-bottom: 0; }
 #preview-root p, #preview-root ul, #preview-root ol, #preview-root blockquote, #preview-root table {
   margin-top: 0;
   margin-bottom: 1em;
 }
-#preview-root a { color: var(--link); text-decoration: none; }
+#preview-root li::marker { color: var(--md-list-bullet); }
+#preview-root a { color: var(--md-link); text-decoration: none; }
 #preview-root a:hover { text-decoration: underline; }
+#preview-root a.uri, #preview-root .uri { color: var(--md-link-url); }
 #preview-root blockquote {
   margin-left: 0;
-  padding: 0 1em;
-  border-left: 0.25em solid var(--border);
-  color: var(--muted);
+  padding: 0.2em 1em;
+  border-left: 0.25em solid var(--md-quote-border);
+  border-radius: 0 8px 8px 0;
+  background: var(--blockquote-bg);
+  color: var(--md-quote);
 }
 #preview-root pre {
-  background: var(--code-bg);
-  border: 1px solid var(--border);
+  background: var(--panel-2);
+  border: 1px solid var(--md-codeblock-border);
   border-radius: 8px;
   padding: 12px 14px;
   overflow: auto;
@@ -2408,10 +2899,14 @@ body {
 #preview-root code {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
   font-size: 0.9em;
+  color: var(--md-code);
+}
+#preview-root pre code {
+  color: var(--text);
 }
 #preview-root :not(pre) > code {
-  background: var(--code-bg);
-  border: 1px solid var(--border);
+  background: var(--inline-code-bg);
+  border: 1px solid var(--md-codeblock-border);
   border-radius: 6px;
   padding: 0.12em 0.35em;
 }
@@ -2496,6 +2991,10 @@ body {
 #preview-root code span.op {
   color: var(--syntax-operator);
 }
+#preview-root code span.pp,
+#preview-root code span.pu {
+  color: var(--syntax-punctuation);
+}
 #preview-root code span.er,
 #preview-root code span.al {
   color: var(--syntax-error);
@@ -2508,12 +3007,18 @@ body {
   overflow: auto;
 }
 #preview-root th, #preview-root td {
-  border: 1px solid var(--border);
+  border: 1px solid var(--md-table-border);
   padding: 6px 12px;
+}
+#preview-root thead th {
+  background: var(--panel-2);
+}
+#preview-root tbody tr:nth-child(even) {
+  background: var(--table-alt-bg);
 }
 #preview-root hr {
   border: 0;
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--md-hr);
   margin: 1.25em 0;
 }
 #preview-root img { max-width: 100%; }
@@ -2898,10 +3403,7 @@ ${annotationHelpersScript}
 
       try {
         const { default: mermaid } = await import('https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs');
-        mermaid.initialize({
-          startOnLoad: false,
-          theme: '${style.themeMode === "dark" ? "dark" : "default"}',
-        });
+        mermaid.initialize(${mermaidConfigJson});
         mermaidBlocks.forEach(pre => {
           const code = pre.querySelector('code');
           const src = code ? code.textContent : pre.textContent;
@@ -2937,7 +3439,7 @@ ${annotationHelpersScript}
 </html>`;
 }
 
-async function openPreviewInBrowser(ctx: ExtensionCommandContext, markdownOverride?: string, resourcePath?: string, isLatex?: boolean): Promise<void> {
+async function openPreviewInBrowser(ctx: ExtensionCommandContext, markdownOverride?: string, resourcePath?: string, isLatex?: boolean, fontSizePx?: number): Promise<void> {
 	const markdown = markdownOverride ?? getLastAssistantMarkdown(ctx);
 	if (!markdown) {
 		throw new Error("No assistant markdown found in the current branch.");
@@ -2946,7 +3448,7 @@ async function openPreviewInBrowser(ctx: ExtensionCommandContext, markdownOverri
 	const style = getPreviewStyle(ctx.ui.theme);
 	const { normalizedMarkdown, pandocMarkdown, annotationPlaceholders } = prepareBrowserPreviewMarkdown(markdown, isLatex);
 	const fragmentHtml = await renderMarkdownToHtmlWithPandoc(pandocMarkdown, resourcePath, isLatex);
-	const html = buildBrowserHtmlFromPandocFragment(fragmentHtml, style, resourcePath, annotationPlaceholders);
+	const html = buildBrowserHtmlFromPandocFragment(fragmentHtml, style, resourcePath, annotationPlaceholders, fontSizePx);
 	const hash = createHash("sha256")
 		.update(RENDER_VERSION)
 		.update("\u0000")
@@ -2996,12 +3498,25 @@ function tokenizeArgs(input: string): string[] {
 	return tokens;
 }
 
-function parsePreviewArgs(args: string): { target?: PreviewTarget; pick?: boolean; file?: string; help?: boolean; error?: string } {
+function parsePreviewFontSize(raw: string): { value?: number; error?: string } {
+	const match = raw.trim().toLowerCase().match(/^(\d+(?:\.\d+)?)(?:px)?$/);
+	if (!match) {
+		return { error: `Invalid font size "${raw}". Use a number in px, e.g. --font-size 14.` };
+	}
+	const value = Number(match[1]);
+	if (!Number.isFinite(value) || value < MIN_PREVIEW_FONT_SIZE_PX || value > MAX_PREVIEW_FONT_SIZE_PX) {
+		return { error: `Font size must be between ${MIN_PREVIEW_FONT_SIZE_PX} and ${MAX_PREVIEW_FONT_SIZE_PX}px.` };
+	}
+	return { value: normalizePreviewFontSizePx(value) };
+}
+
+function parsePreviewArgs(args: string): { target?: PreviewTarget; pick?: boolean; file?: string; fontSizePx?: number; help?: boolean; error?: string } {
 	const tokens = tokenizeArgs(args);
 	let target: PreviewTarget = "terminal";
 	let explicitTarget = false;
 	let pick = false;
 	let file: string | undefined;
+	let fontSizePx: number | undefined;
 
 	for (let i = 0; i < tokens.length; i++) {
 		const token = tokens[i]!;
@@ -3022,6 +3537,26 @@ function parsePreviewArgs(args: string): { target?: PreviewTarget; pick?: boolea
 			}
 			file = next;
 			i++;
+			continue;
+		}
+
+		if (token === "--font-size" || token === "--font-size-px" || token === "--fs") {
+			const next = tokens[i + 1];
+			if (!next || next.startsWith("-")) {
+				return { error: "Missing font size after --font-size." };
+			}
+			const parsedFontSize = parsePreviewFontSize(next);
+			if (parsedFontSize.error || parsedFontSize.value === undefined) return { error: parsedFontSize.error ?? "Invalid font size." };
+			fontSizePx = parsedFontSize.value;
+			i++;
+			continue;
+		}
+
+		const fontSizeEquals = token.match(/^--(?:font-size|font-size-px|fs)=(.+)$/);
+		if (fontSizeEquals) {
+			const parsedFontSize = parsePreviewFontSize(fontSizeEquals[1]!);
+			if (parsedFontSize.error || parsedFontSize.value === undefined) return { error: parsedFontSize.error ?? "Invalid font size." };
+			fontSizePx = parsedFontSize.value;
 			continue;
 		}
 
@@ -3069,21 +3604,21 @@ function parsePreviewArgs(args: string): { target?: PreviewTarget; pick?: boolea
 			continue;
 		}
 
-		return { error: `Unknown argument \"${token}\". Use /preview [--pick|-p] [--file|-f <path>] [--browser] [--pdf] [--terminal]` };
+		return { error: `Unknown argument \"${token}\". Use /preview [--pick|-p] [--file|-f <path>] [--browser] [--pdf] [--terminal] [--font-size <px>]` };
 	}
 
 	if (file && pick) {
 		return { error: "Cannot use --pick and --file together." };
 	}
 
-	return { target, pick, file };
+	return { target, pick, file, fontSizePx };
 }
 
 export default function (pi: ExtensionAPI) {
 	const run = async (args: string, ctx: ExtensionCommandContext) => {
 		const parsed = parsePreviewArgs(args);
 		if (parsed.help) {
-			ctx.ui.notify("Usage: /preview [--pick|-p] [--file|-f <path>] [--browser] [--pdf] [--terminal]  or  /preview <path>", "info");
+			ctx.ui.notify("Usage: /preview [--pick|-p] [--file|-f <path>] [--browser] [--pdf] [--terminal] [--font-size <px>]  or  /preview <path>", "info");
 			return;
 		}
 		if (parsed.error || !parsed.target) {
@@ -3125,16 +3660,15 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const effectiveMarkdown = markdown ?? getLastAssistantMarkdown(ctx);
-		if (!resourcePath && effectiveMarkdown && hasLikelyRelativeLocalImages(effectiveMarkdown)) {
-			ctx.ui.notify(
-				"Relative local image paths may not resolve for assistant-response previews. Use /preview --file <path> for reliable local image loading.",
-				"warning",
-			);
+		if (!resourcePath && effectiveMarkdown) {
+			// Assistant-response previews do not have a source file, so resolve
+			// relative local images and other assets against pi's current cwd.
+			resourcePath = ctx.cwd;
 		}
 
 		if (parsed.target === "browser") {
 			try {
-				await openPreviewInBrowser(ctx, markdown, resourcePath, isLatex);
+				await openPreviewInBrowser(ctx, markdown, resourcePath, isLatex, parsed.fontSizePx);
 				ctx.ui.notify("Opened preview in browser.", "info");
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
@@ -3154,11 +3688,11 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		await openPreview(ctx, markdown, resourcePath, isLatex);
+		await openPreview(ctx, markdown, resourcePath, isLatex, parsed.fontSizePx);
 	};
 
 	pi.registerCommand("preview", {
-		description: "Rendered markdown preview (--pick select response, --file <path> or bare path, --browser for HTML, --pdf for PDF, --terminal to force inline)",
+		description: "Rendered markdown preview (--pick select response, --file <path> or bare path, --browser for HTML, --pdf for PDF, --terminal to force inline, --font-size <px>)",
 		handler: run,
 	});
 

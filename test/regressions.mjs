@@ -9,8 +9,23 @@ const src = readFileSync(sourcePath, "utf-8");
 assert.match(src, /function buildRenderCacheKey\s*\(/, "Missing buildRenderCacheKey helper.");
 assert.match(
 	src,
-	/const cacheKey = buildRenderCacheKey\(style\.cacheKey,\s*resourcePath,\s*isLatex\)/,
-	"renderPreview should scope cache by style/resourcePath/isLatex.",
+	/const DEFAULT_TERMINAL_PREVIEW_FONT_SIZE_PX = 16;/,
+	"Terminal preview should keep the known-good crisp default font size.",
+);
+assert.match(
+	src,
+	/const DEFAULT_BROWSER_PREVIEW_FONT_SIZE_PX = 15;/,
+	"Browser preview default font size should match Studio's compact markdown rendering.",
+);
+assert.match(
+	src,
+	/const DEFAULT_TERMINAL_DEVICE_SCALE_FACTOR = 2;/,
+	"Terminal preview should keep the known-good screenshot density.",
+);
+assert.match(
+	src,
+	/const cacheKey = buildRenderCacheKey\(`\$\{style\.cacheKey\}\|fontSize=\$\{previewFontSizePx\}\|scale=\$\{deviceScaleFactor\}`,[\s\S]*?resourcePath,[\s\S]*?isLatex\)/,
+	"renderPreview should scope cache by style/resourcePath/isLatex/fontSize/deviceScaleFactor.",
 );
 
 assert.match(
@@ -80,8 +95,8 @@ assert.match(
 
 assert.match(
 	src,
-	/hasLikelyRelativeLocalImages\(effectiveMarkdown\)/,
-	"Expected warning hook for likely unresolved relative images.",
+	/resourcePath = ctx\.cwd;/,
+	"Assistant-response previews should resolve relative local images against ctx.cwd.",
 );
 
 assert.match(src, /function getLongestFenceRun\s*\(/, "Missing adaptive fence-length helper.");
@@ -107,7 +122,7 @@ assert.match(src, /const PREVIEW_ANNOTATION_PLACEHOLDER_PREFIX = "PIMDPREVIEWANN
 assert.match(src, /const ANNOTATION_HELPERS_SOURCE = readFileSync\(new URL\("\.\/client\/annotation-helpers\.js", import\.meta\.url\), "utf-8"\);/, "Browser preview should embed the annotation helper script.");
 assert.match(src, /function prepareBrowserPreviewMarkdown\s*\(/, "Missing browser preview annotation preparation helper.");
 assert.match(src, /prepareMarkdownForPandocPreview\(normalizedMarkdown, PREVIEW_ANNOTATION_PLACEHOLDER_PREFIX\)/, "Browser preview should replace prose annotations with placeholders before pandoc.");
-assert.match(src, /buildBrowserHtmlFromPandocFragment\(fragmentHtml, style, resourcePath, annotationPlaceholders\)/, "Browser preview HTML builder should receive annotation placeholders.");
+assert.match(src, /buildBrowserHtmlFromPandocFragment\(fragmentHtml, style, resourcePath, annotationPlaceholders(?:,\s*(?:previewFontSizePx|fontSizePx))?\)/, "Browser preview HTML builder should receive annotation placeholders.");
 
 assert.match(src, /function escapeLatexText\s*\(/, "Missing PDF annotation LaTeX escaping helper.");
 assert.match(src, /function getMathPattern\s*\(/, "Missing shared PDF annotation math-pattern helper.");
@@ -119,7 +134,7 @@ assert.match(src, /function renderAnnotationPdfLatex\s*\(/, "Missing markdown-is
 assert.match(src, /function renderAnnotationCodeSpanPdfLatex\s*\(/, "Missing PDF annotation code-span renderer.");
 assert.match(src, /function renderAnnotationPlainTextPdfLatex\s*\(/, "Missing PDF annotation emphasis renderer.");
 assert.match(src, /const cleaned = renderAnnotationPdfLatex\(marker\.body\);/, "PDF prose annotation replacement should use the markdown-ish annotation renderer.");
-assert.match(src, /return transformMarkdownOutsideFences\(markdown, \(segment\) => replaceAnnotationMarkersForPdfInSegment\(segment\)\);/, "PDF prose annotation replacement should transform only markdown outside fences.");
+assert.match(src, /return transformMarkdownOutsideFences\(markdown, \(segment(?::\s*string)?\) => replaceAnnotationMarkersForPdfInSegment\(segment\)\);/, "PDF prose annotation replacement should transform only markdown outside fences.");
 
 assert.match(src, /function decodeGeneratedLatexCodeText\s*\(/, "Missing generated-LaTeX code-text decode helper.");
 assert.ok(
