@@ -44,11 +44,15 @@ assert.match(
 	"PDF input format should allow lists, blockquotes, and headings without a preceding blank line and disable raw HTML.",
 );
 assert.ok(
-	src.includes(String.raw`\\usepackage{varwidth}`),
-	"PDF preamble should use a varwidth annotation box so long notes wrap cleanly.",
+	src.includes(String.raw`\\IfFileExists{titlesec.sty}`) && src.includes(String.raw`\\IfFileExists{enumitem.sty}`),
+	"PDF preamble should make cosmetic heading/list packages optional.",
 );
 assert.ok(
-	src.includes(String.raw`\\newcommand{\\piannotation}[1]{\\begingroup\\setlength{\\fboxsep}{1.5pt}\\fcolorbox{PiAnnotationBorder}{PiAnnotationBg}`),
+	src.includes(String.raw`\\IfFileExists{varwidth.sty}`) && src.includes(String.raw`\\parbox{\\dimexpr\\linewidth-2\\fboxsep-2\\fboxrule\\relax}`),
+	"PDF annotation boxes should use varwidth when available and a parbox fallback otherwise.",
+);
+assert.ok(
+	src.includes(String.raw`\\newcommand{\\piannotation}[1]{%`) && src.includes(String.raw`\\fcolorbox{PiAnnotationBorder}{PiAnnotationBg}{%`),
 	"PDF annotation macro should use a boxed annotation style instead of raw soul highlighting.",
 );
 assert.ok(
@@ -56,8 +60,27 @@ assert.ok(
 	"PDF preamble should define dedicated diff add token colours.",
 );
 assert.ok(
-	src.includes(String.raw`\\RecustomVerbatimEnvironment{Highlighting}{Verbatim}{commandchars=\\\\\\{\\},breaklines,breakanywhere}`),
-	"PDF preamble should enable wrap-friendly highlighted verbatim blocks.",
+	src.includes(String.raw`\\IfFileExists{framed.sty}`) &&
+		src.includes(String.raw`\\definecolor{shadecolor}{HTML}{F6F8FA}`) &&
+		src.includes(String.raw`\\renewenvironment{Shaded}{\\begin{snugshade}}{\\end{snugshade}}`),
+	"PDF preamble should add a light code-block background when framed is available.",
+);
+assert.ok(
+	src.includes(String.raw`\\IfFileExists{fvextra.sty}`) && src.includes(String.raw`\\RecustomVerbatimEnvironment{Highlighting}{Verbatim}{commandchars=\\\\\\{\\},breaklines,breakanywhere}`),
+	"PDF preamble should enable wrap-friendly highlighted verbatim blocks when fvextra is available.",
+);
+assert.ok(
+	src.includes("--pdf-engine-opt=-interaction=nonstopmode") && src.includes("--pdf-engine-opt=-halt-on-error"),
+	"PDF export should pass non-interactive LaTeX engine options when using LaTeX engines.",
+);
+assert.match(
+	src,
+	/child\.stdout\.on\("data", \(chunk: Buffer \| string\) => \{\s*stdoutChunks\.push/s,
+	"PDF subprocess stdout should be drained so verbose LaTeX output cannot block the command.",
+);
+assert.ok(
+	src.includes("PI_MARKDOWN_PREVIEW_PDF_TIMEOUT_MS") && src.includes("pandoc PDF export timed out"),
+	"PDF export should have a configurable timeout instead of hanging indefinitely.",
 );
 
 assert.match(

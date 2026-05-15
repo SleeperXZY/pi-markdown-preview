@@ -46,6 +46,9 @@ const MAX_TERMINAL_DEVICE_SCALE_FACTOR = 2.5;
 const VIEWPORT_WIDTH_PX = 1200;
 const PAGE_HEIGHT_PX = 2200;
 const MAX_RENDER_HEIGHT_PX = 66000; // PAGE_HEIGHT_PX * 30
+const DEFAULT_PDF_RENDER_TIMEOUT_MS = 120000;
+const MIN_PDF_RENDER_TIMEOUT_MS = 10000;
+const MAX_PDF_RENDER_TIMEOUT_MS = 600000;
 
 type ThemeMode = "dark" | "light";
 type PreviewTarget = "terminal" | "browser" | "pdf";
@@ -213,6 +216,28 @@ function getTerminalDeviceScaleFactor(): number {
 	const configured = Number(process.env.PI_MARKDOWN_PREVIEW_DEVICE_SCALE_FACTOR ?? "");
 	if (Number.isFinite(configured) && configured > 0) return clampTerminalDeviceScaleFactor(configured);
 	return DEFAULT_TERMINAL_DEVICE_SCALE_FACTOR;
+}
+
+function getPdfRenderTimeoutMs(): number {
+	const configured = Number(process.env.PI_MARKDOWN_PREVIEW_PDF_TIMEOUT_MS ?? "");
+	if (Number.isFinite(configured) && configured > 0) {
+		return Math.round(Math.max(MIN_PDF_RENDER_TIMEOUT_MS, Math.min(MAX_PDF_RENDER_TIMEOUT_MS, configured)));
+	}
+	return DEFAULT_PDF_RENDER_TIMEOUT_MS;
+}
+
+function getLatexEngineName(engine: string): string {
+	return basename(engine).toLowerCase().replace(/\.exe$/, "");
+}
+
+function getPandocLatexEngineOptions(engine: string): string[] {
+	const engineName = getLatexEngineName(engine);
+	if (!["pdflatex", "xelatex", "lualatex", "latexmk"].includes(engineName)) return [];
+	return ["--pdf-engine-opt=-interaction=nonstopmode", "--pdf-engine-opt=-halt-on-error"];
+}
+
+function formatTimeoutMs(timeoutMs: number): string {
+	return timeoutMs % 1000 === 0 ? `${timeoutMs / 1000}s` : `${timeoutMs}ms`;
 }
 
 function toHexByte(value: number): string {
@@ -2066,39 +2091,75 @@ async function renderMarkdownToHtmlWithPandoc(markdown: string, resourcePath?: s
 	});
 }
 
-const PDF_PREAMBLE = `\\usepackage{titlesec}
-\\titleformat{\\section}{\\Large\\bfseries\\sffamily}{}{0pt}{}[\\vspace{2pt}\\titlerule]
-\\titleformat{\\subsection}{\\large\\bfseries\\sffamily}{}{0pt}{}
-\\titleformat{\\subsubsection}{\\normalsize\\bfseries\\sffamily}{}{0pt}{}
-\\titlespacing*{\\section}{0pt}{1.5ex plus 0.5ex minus 0.2ex}{1ex plus 0.2ex}
-\\titlespacing*{\\subsection}{0pt}{1.2ex plus 0.4ex minus 0.2ex}{0.6ex plus 0.1ex}
-\\usepackage{enumitem}
-\\setlist[itemize]{nosep, leftmargin=1.5em}
-\\setlist[enumerate]{nosep, leftmargin=1.5em}
-\\usepackage{parskip}
-\\usepackage{xcolor}
-\\usepackage{varwidth}
-\\definecolor{PiAnnotationBg}{HTML}{EAF3FF}
-\\definecolor{PiAnnotationBorder}{HTML}{8CB8FF}
-\\definecolor{PiAnnotationText}{HTML}{1F5FBF}
-\\definecolor{PiDiffAddText}{HTML}{1A7F37}
-\\definecolor{PiDiffDelText}{HTML}{CF222E}
-\\definecolor{PiDiffMetaText}{HTML}{57606A}
-\\definecolor{PiDiffHunkText}{HTML}{0969DA}
-\\newcommand{\\piannotation}[1]{\\begingroup\\setlength{\\fboxsep}{1.5pt}\\fcolorbox{PiAnnotationBorder}{PiAnnotationBg}{\\begin{varwidth}{\\dimexpr\\linewidth-2\\fboxsep-2\\fboxrule\\relax}\\raggedright\\textcolor{PiAnnotationText}{\\sffamily\\strut #1}\\end{varwidth}}\\endgroup}
+const PDF_PREAMBLE = `% Optional styling: keep PDF export usable on smaller TeX installs.
+\\IfFileExists{titlesec.sty}{%
+  \\usepackage{titlesec}%
+  \\titleformat{\\section}{\\Large\\bfseries\\sffamily}{}{0pt}{}[\\vspace{2pt}\\titlerule]%
+  \\titleformat{\\subsection}{\\large\\bfseries\\sffamily}{}{0pt}{}%
+  \\titleformat{\\subsubsection}{\\normalsize\\bfseries\\sffamily}{}{0pt}{}%
+  \\titlespacing*{\\section}{0pt}{1.5ex plus 0.5ex minus 0.2ex}{1ex plus 0.2ex}%
+  \\titlespacing*{\\subsection}{0pt}{1.2ex plus 0.4ex minus 0.2ex}{0.6ex plus 0.1ex}%
+}{}
+\\IfFileExists{enumitem.sty}{%
+  \\usepackage{enumitem}%
+  \\setlist[itemize]{nosep, leftmargin=1.5em}%
+  \\setlist[enumerate]{nosep, leftmargin=1.5em}%
+}{}
+\\IfFileExists{parskip.sty}{\\usepackage{parskip}}{}
+\\IfFileExists{xcolor.sty}{%
+  \\usepackage{xcolor}%
+  \\definecolor{PiAnnotationBg}{HTML}{EAF3FF}%
+  \\definecolor{PiAnnotationBorder}{HTML}{8CB8FF}%
+  \\definecolor{PiAnnotationText}{HTML}{1F5FBF}%
+  \\definecolor{PiDiffAddText}{HTML}{1A7F37}%
+  \\definecolor{PiDiffDelText}{HTML}{CF222E}%
+  \\definecolor{PiDiffMetaText}{HTML}{57606A}%
+  \\definecolor{PiDiffHunkText}{HTML}{0969DA}%
+  \\definecolor{PiCodeBg}{HTML}{F6F8FA}%
+}{%
+  \\providecommand{\\textcolor}[2]{#2}%
+  \\providecommand{\\fcolorbox}[3]{#3}%
+}
+\\IfFileExists{framed.sty}{%
+  \\ifcsname definecolor\\endcsname
+    \\usepackage{framed}%
+    \\definecolor{shadecolor}{HTML}{F6F8FA}%
+    \\ifcsname Shaded\\endcsname
+      \\renewenvironment{Shaded}{\\begin{snugshade}}{\\end{snugshade}}%
+    \\else
+      \\newenvironment{Shaded}{\\begin{snugshade}}{\\end{snugshade}}%
+    \\fi
+  \\fi
+}{}
+\\newif\\ifPiMarkdownPreviewHasVarwidth
+\\IfFileExists{varwidth.sty}{\\usepackage{varwidth}\\PiMarkdownPreviewHasVarwidthtrue}{\\PiMarkdownPreviewHasVarwidthfalse}
+\\newcommand{\\piannotation}[1]{%
+  \\begingroup
+  \\setlength{\\fboxsep}{1.5pt}%
+  \\fcolorbox{PiAnnotationBorder}{PiAnnotationBg}{%
+    \\ifPiMarkdownPreviewHasVarwidth
+      \\begin{varwidth}{\\dimexpr\\linewidth-2\\fboxsep-2\\fboxrule\\relax}%
+      \\raggedright\\textcolor{PiAnnotationText}{\\sffamily\\strut #1}%
+      \\end{varwidth}%
+    \\else
+      \\parbox{\\dimexpr\\linewidth-2\\fboxsep-2\\fboxrule\\relax}{\\raggedright\\textcolor{PiAnnotationText}{\\sffamily\\strut #1}}%
+    \\fi
+  }%
+  \\endgroup
+}
 \\newcommand{\\PiDiffAddTok}[1]{\\textcolor{PiDiffAddText}{#1}}
 \\newcommand{\\PiDiffDelTok}[1]{\\textcolor{PiDiffDelText}{#1}}
 \\newcommand{\\PiDiffMetaTok}[1]{\\textcolor{PiDiffMetaText}{#1}}
 \\newcommand{\\PiDiffHunkTok}[1]{\\textcolor{PiDiffHunkText}{#1}}
 \\newcommand{\\PiDiffHeaderTok}[1]{\\textcolor{PiDiffHunkText}{\\textbf{#1}}}
-\\usepackage{fvextra}
-\\makeatletter
-\\@ifundefined{Highlighting}{%
-  \\DefineVerbatimEnvironment{Highlighting}{Verbatim}{commandchars=\\\\\\{\\},breaklines,breakanywhere}%
-}{%
-  \\RecustomVerbatimEnvironment{Highlighting}{Verbatim}{commandchars=\\\\\\{\\},breaklines,breakanywhere}%
-}
-\\makeatother
+\\IfFileExists{fvextra.sty}{%
+  \\usepackage{fvextra}%
+  \\ifcsname Highlighting\\endcsname
+    \\RecustomVerbatimEnvironment{Highlighting}{Verbatim}{commandchars=\\\\\\{\\},breaklines,breakanywhere}%
+  \\else
+    \\DefineVerbatimEnvironment{Highlighting}{Verbatim}{commandchars=\\\\\\{\\},breaklines,breakanywhere}%
+  \\fi
+}{}
 `;
 
 const PDF_PREAMBLE_PATH = join(CACHE_DIR, "_pdf_preamble.tex");
@@ -2141,6 +2202,16 @@ async function compileLatexToPdf(latexSource: string, outputPath: string, resour
 
 			const stderrChunks: Buffer[] = [];
 			const stdoutChunks: Buffer[] = [];
+			let passSettled = false;
+			const timeoutMs = getPdfRenderTimeoutMs();
+			const timeout = setTimeout(() => {
+				if (passSettled) return;
+				passSettled = true;
+				child.kill("SIGTERM");
+				reject(new Error(`${engine} timed out after ${formatTimeoutMs(timeoutMs)} on pass ${pass}.`));
+			}, timeoutMs);
+			timeout.unref?.();
+
 			child.stdout.on("data", (chunk: Buffer | string) => {
 				stdoutChunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
 			});
@@ -2149,6 +2220,9 @@ async function compileLatexToPdf(latexSource: string, outputPath: string, resour
 			});
 
 			child.once("error", (error) => {
+				if (passSettled) return;
+				passSettled = true;
+				clearTimeout(timeout);
 				const errno = error as NodeJS.ErrnoException;
 				if (errno.code === "ENOENT") {
 					reject(new Error(
@@ -2160,11 +2234,14 @@ async function compileLatexToPdf(latexSource: string, outputPath: string, resour
 			});
 
 			child.once("close", (code) => {
+				if (passSettled) return;
+				passSettled = true;
+				clearTimeout(timeout);
 				if (code !== 0 && pass === 2) {
-					const log = Buffer.concat(stdoutChunks).toString("utf-8");
+					const log = `${Buffer.concat(stdoutChunks).toString("utf-8")}\n${Buffer.concat(stderrChunks).toString("utf-8")}`;
 					// Extract the first LaTeX error line for a useful message
 					const errorMatch = log.match(/^! .+$/m);
-					const hint = errorMatch ? errorMatch[0] : "";
+					const hint = errorMatch ? errorMatch[0] : log.trim().slice(-2000);
 					reject(new Error(`${engine} failed (exit ${code})${hint ? `: ${hint}` : ""}`));
 					return;
 				}
@@ -2195,6 +2272,7 @@ async function renderMarkdownToPdf(markdown: string, outputPath: string, resourc
 		"-f", "markdown+lists_without_preceding_blankline-blank_before_blockquote-blank_before_header+tex_math_dollars+autolink_bare_uris+superscript+subscript-raw_html",
 		"-o", outputPath,
 		`--pdf-engine=${pdfEngine}`,
+		...getPandocLatexEngineOptions(pdfEngine),
 		"-V", "geometry:margin=2.2cm",
 		"-V", "fontsize=11pt",
 		"-V", "linestretch=1.25",
@@ -2206,15 +2284,26 @@ async function renderMarkdownToPdf(markdown: string, outputPath: string, resourc
 
 	return await new Promise<void>((resolve, reject) => {
 		const child = spawn(pandocCommand, args, { stdio: ["pipe", "pipe", "pipe"] });
+		const stdoutChunks: Buffer[] = [];
 		const stderrChunks: Buffer[] = [];
 		let settled = false;
+		const timeoutMs = getPdfRenderTimeoutMs();
+		const timeout = setTimeout(() => {
+			child.kill("SIGTERM");
+			fail(new Error(`pandoc PDF export timed out after ${formatTimeoutMs(timeoutMs)}.`));
+		}, timeoutMs);
+		timeout.unref?.();
 
 		const fail = (error: Error) => {
 			if (settled) return;
 			settled = true;
+			clearTimeout(timeout);
 			reject(error);
 		};
 
+		child.stdout.on("data", (chunk: Buffer | string) => {
+			stdoutChunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+		});
 		child.stderr.on("data", (chunk: Buffer | string) => {
 			stderrChunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
 		});
@@ -2234,16 +2323,19 @@ async function renderMarkdownToPdf(markdown: string, outputPath: string, resourc
 
 		child.once("close", (code) => {
 			if (settled) return;
-			settled = true;
+			clearTimeout(timeout);
 			if (code === 0) {
+				settled = true;
 				resolve();
 				return;
 			}
 			const stderr = Buffer.concat(stderrChunks).toString("utf-8").trim();
-			const hint = stderr.includes("not found") || stderr.includes("pdflatex") || stderr.includes("xelatex")
-				? "\nPDF export requires a LaTeX engine. Install TeX Live (brew install --cask mactex / apt install texlive) or set PANDOC_PDF_ENGINE to your preferred engine."
+			const stdout = Buffer.concat(stdoutChunks).toString("utf-8").trim();
+			const details = stderr || stdout.slice(-4000);
+			const hint = details.includes("not found") || details.includes("pdflatex") || details.includes("xelatex") || details.includes(".sty")
+				? "\nPDF export requires a LaTeX engine and common LaTeX packages. Install a fuller TeX Live package set (e.g. texlive-latexextra on Arch) or set PANDOC_PDF_ENGINE to your preferred engine."
 				: "";
-			fail(new Error(`pandoc PDF export failed with exit code ${code}${stderr ? `: ${stderr}` : ""}${hint}`));
+			fail(new Error(`pandoc PDF export failed with exit code ${code}${details ? `: ${details}` : ""}${hint}`));
 		});
 
 		child.stdin.end(pandocInput);
@@ -2450,10 +2542,17 @@ async function renderMarkdownToPdfViaGeneratedLatex(markdown: string, outputPath
 		const stdoutChunks: Buffer[] = [];
 		const stderrChunks: Buffer[] = [];
 		let settled = false;
+		const timeoutMs = getPdfRenderTimeoutMs();
+		const timeout = setTimeout(() => {
+			child.kill("SIGTERM");
+			fail(new Error(`pandoc LaTeX generation timed out after ${formatTimeoutMs(timeoutMs)}.`));
+		}, timeoutMs);
+		timeout.unref?.();
 
 		const fail = (error: Error) => {
 			if (settled) return;
 			settled = true;
+			clearTimeout(timeout);
 			reject(error);
 		};
 
@@ -2481,6 +2580,7 @@ async function renderMarkdownToPdfViaGeneratedLatex(markdown: string, outputPath
 			if (settled) return;
 			if (code === 0) {
 				settled = true;
+				clearTimeout(timeout);
 				resolve(Buffer.concat(stdoutChunks).toString("utf-8"));
 				return;
 			}
@@ -2527,10 +2627,17 @@ async function renderMermaidDiagramForPdf(source: string, outputPath: string): P
 			const child = spawn(mermaidCommand, args, { stdio: ["ignore", "ignore", "pipe"] });
 			const stderrChunks: Buffer[] = [];
 			let settled = false;
+			const timeoutMs = getPdfRenderTimeoutMs();
+			const timeout = setTimeout(() => {
+				child.kill("SIGTERM");
+				fail(new Error(`Mermaid CLI timed out after ${formatTimeoutMs(timeoutMs)}.`));
+			}, timeoutMs);
+			timeout.unref?.();
 
 			const fail = (error: Error) => {
 				if (settled) return;
 				settled = true;
+				clearTimeout(timeout);
 				reject(error);
 			};
 
@@ -2554,6 +2661,7 @@ async function renderMermaidDiagramForPdf(source: string, outputPath: string): P
 			child.once("close", (code) => {
 				if (settled) return;
 				settled = true;
+				clearTimeout(timeout);
 				if (code === 0) {
 					resolve();
 					return;
@@ -3679,6 +3787,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (parsed.target === "pdf") {
 			try {
+				ctx.ui.notify("Exporting PDF preview...", "info");
 				await exportPdf(ctx, markdown, resourcePath, isLatex);
 				ctx.ui.notify("Opened PDF preview.", "info");
 			} catch (error) {

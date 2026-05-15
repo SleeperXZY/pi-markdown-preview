@@ -95,6 +95,8 @@ Additional accepted argument aliases:
 - Help: `--help`, `-h`, `help`
 - Note: `--pick` and `--file` cannot be used together
 
+PDF export uses Pandoc plus a LaTeX PDF engine (`xelatex` by default). The PDF preamble uses optional styling packages when they are available (including light code-block backgrounds via `framed`) and falls back to simpler output otherwise. Long-running PDF subprocesses time out after 120 seconds by default; set `PI_MARKDOWN_PREVIEW_PDF_TIMEOUT_MS` to adjust this.
+
 To validate command docs against implementation:
 
 ```bash
