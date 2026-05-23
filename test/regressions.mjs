@@ -35,8 +35,8 @@ assert.match(
 );
 assert.match(
 	src,
-	/\["-f", inputFormat, "-t", "html5", "--mathml", "--wrap=none"\]/,
-	"HTML preview should pass --wrap=none so long annotation markers survive pandoc wrapping.",
+	/\["-f", inputFormat, "-t", "html5", mathRenderer === "mathjax" \? "--mathjax" : "--mathml", "--wrap=none"\]/,
+	"HTML preview should choose MathJax or MathML output and pass --wrap=none so long annotation markers survive pandoc wrapping.",
 );
 assert.match(
 	src,
@@ -145,7 +145,7 @@ assert.match(src, /const PREVIEW_ANNOTATION_PLACEHOLDER_PREFIX = "PIMDPREVIEWANN
 assert.match(src, /const ANNOTATION_HELPERS_SOURCE = readFileSync\(new URL\("\.\/client\/annotation-helpers\.js", import\.meta\.url\), "utf-8"\);/, "Browser preview should embed the annotation helper script.");
 assert.match(src, /function prepareBrowserPreviewMarkdown\s*\(/, "Missing browser preview annotation preparation helper.");
 assert.match(src, /prepareMarkdownForPandocPreview\(normalizedMarkdown, PREVIEW_ANNOTATION_PLACEHOLDER_PREFIX\)/, "Browser preview should replace prose annotations with placeholders before pandoc.");
-assert.match(src, /buildBrowserHtmlFromPandocFragment\(fragmentHtml, style, resourcePath, annotationPlaceholders(?:,\s*(?:previewFontSizePx|fontSizePx))?\)/, "Browser preview HTML builder should receive annotation placeholders.");
+assert.match(src, /buildBrowserHtmlFromPandocFragment\(fragmentHtml, style, resourcePath, annotationPlaceholders[\s\S]*?\)/, "Browser preview HTML builder should receive annotation placeholders.");
 
 assert.match(src, /function escapeLatexText\s*\(/, "Missing PDF annotation LaTeX escaping helper.");
 assert.match(src, /function getMathPattern\s*\(/, "Missing shared PDF annotation math-pattern helper.");
@@ -203,8 +203,8 @@ assert.match(src, /const renderAnnotationMarkerMath = async \(root\) =>/, "Missi
 assert.match(src, /await mathJax\.typesetPromise\(markers\);/, "Browser annotation math rendering should typeset full marker elements so emphasis/code markup survives.");
 
 assert.ok(
-	src.includes("https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"),
-	"Browser/terminal preview should include a MathJax fallback loader for unsupported pandoc math.",
+	src.includes("./node_modules/mathjax/es5/tex-chtml.js") && src.includes("MATHJAX_SCRIPT_URL"),
+	"Browser/terminal preview should load MathJax from node_modules for preview equations.",
 );
 assert.match(
 	src,

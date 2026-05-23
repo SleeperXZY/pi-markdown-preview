@@ -2005,7 +2005,7 @@ async function openPreview(ctx: ExtensionCommandContext, markdownOverride?: stri
 				return refreshed;
 			},
 			async () => {
-				await openPreviewInBrowser(ctx, markdown, resourcePath, isLatex, previewFontSizePx);
+				await openPreviewInBrowser(ctx, markdown, resourcePath, isLatex, previewFontSizePx, undefined);
 			},
 		),
 	);
@@ -2033,11 +2033,11 @@ async function openFileInDefaultBrowser(filePath: string): Promise<void> {
 	});
 }
 
-async function renderMarkdownToHtmlWithPandoc(markdown: string, resourcePath?: string, isLatex?: boolean): Promise<string> {
+async function renderMarkdownToHtmlWithPandoc(markdown: string, resourcePath?: string, isLatex?: boolean, mathRenderer: "mathml" | "mathjax" = "mathml"): Promise<string> {
 	const pandocCommand = process.env.PANDOC_PATH?.trim() || "pandoc";
 	const pandocInput = isLatex ? markdown : normalizeMarkdownFencedBlocks(markdown);
 	const inputFormat = isLatex ? "latex" : "markdown+lists_without_preceding_blankline-blank_before_blockquote-blank_before_header+tex_math_dollars+autolink_bare_uris-raw_html";
-	const args = ["-f", inputFormat, "-t", "html5", "--mathml", "--wrap=none"];
+	const args = ["-f", inputFormat, "-t", "html5", mathRenderer === "mathjax" ? "--mathjax" : "--mathml", "--wrap=none"];
 	if (resourcePath) args.push(`--resource-path=${resourcePath}`);
 
 	return await new Promise<string>((resolve, reject) => {
@@ -2092,11 +2092,37 @@ async function renderMarkdownToHtmlWithPandoc(markdown: string, resourcePath?: s
 }
 
 const PDF_PREAMBLE = `% Optional styling: keep PDF export usable on smaller TeX installs.
+\\IfFileExists{ctex.sty}{%
+  \\usepackage{ctex}%
+  \\ifcsname IfFontExistsTF\\endcsname
+    \\IfFontExistsTF{Noto Sans CJK SC}{%
+      \\setCJKsansfont{Noto Sans CJK SC}%
+    }{%
+      \\IfFontExistsTF{PingFang SC}{%
+        \\setCJKsansfont{PingFang SC}%
+      }{%
+        \\IfFontExistsTF{Microsoft YaHei}{%
+          \\setCJKsansfont{Microsoft YaHei}%
+        }{%
+          \\IfFontExistsTF{WenQuanYi Zen Hei}{%
+            \\setCJKsansfont{WenQuanYi Zen Hei}%
+          }{}%
+        }%
+      }%
+    }%
+  \\fi
+}{}
 \\IfFileExists{titlesec.sty}{%
   \\usepackage{titlesec}%
-  \\titleformat{\\section}{\\Large\\bfseries\\sffamily}{}{0pt}{}[\\vspace{2pt}\\titlerule]%
-  \\titleformat{\\subsection}{\\large\\bfseries\\sffamily}{}{0pt}{}%
-  \\titleformat{\\subsubsection}{\\normalsize\\bfseries\\sffamily}{}{0pt}{}%
+  \\ifcsname ctexset\\endcsname
+    \\titleformat{\\section}{\\Large\\bfseries}{}{0pt}{}[\\vspace{2pt}\\titlerule]%
+    \\titleformat{\\subsection}{\\large\\bfseries}{}{0pt}{}%
+    \\titleformat{\\subsubsection}{\\normalsize\\bfseries}{}{0pt}{}%
+  \\else
+    \\titleformat{\\section}{\\Large\\bfseries\\sffamily}{}{0pt}{}[\\vspace{2pt}\\titlerule]%
+    \\titleformat{\\subsection}{\\large\\bfseries\\sffamily}{}{0pt}{}%
+    \\titleformat{\\subsubsection}{\\normalsize\\bfseries\\sffamily}{}{0pt}{}%
+  \\fi
   \\titlespacing*{\\section}{0pt}{1.5ex plus 0.5ex minus 0.2ex}{1ex plus 0.2ex}%
   \\titlespacing*{\\subsection}{0pt}{1.2ex plus 0.4ex minus 0.2ex}{0.6ex plus 0.1ex}%
 }{}
@@ -2936,6 +2962,7 @@ function buildBrowserHtmlFromPandocFragment(
 		},
 	};
 	const mermaidConfigJson = JSON.stringify(mermaidConfig).replace(/</g, "\\u003c");
+	const mathJaxScriptUrlJson = JSON.stringify(new URL("./node_modules/mathjax/es5/tex-chtml.js", import.meta.url).href).replace(/</g, "\\u003c");
 	const baseTag = resourcePath ? `\n<base href="${pathToFileURL(resourcePath + "/").href}" />` : "";
 	const annotationHelpersScript = ANNOTATION_HELPERS_SOURCE.replace(/<\/script/gi, "<\\/script");
 	const annotationPlaceholdersJson = JSON.stringify(annotationPlaceholders).replace(/</g, "\\u003c");
@@ -3331,7 +3358,7 @@ ${annotationHelpersScript}
       });
     };
 
-    const MATHJAX_CDN_URL = 'https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js';
+    const MATHJAX_SCRIPT_URL = ${mathJaxScriptUrlJson};
 
     const waitForFonts = async () => {
       if ('fonts' in document) {
@@ -3419,7 +3446,7 @@ ${annotationHelpersScript}
         };
 
         const script = document.createElement('script');
-        script.src = MATHJAX_CDN_URL;
+        script.src = MATHJAX_SCRIPT_URL;
         script.async = true;
         script.onload = () => {
           const api = window.MathJax;
@@ -3547,15 +3574,34 @@ ${annotationHelpersScript}
 </html>`;
 }
 
-async function openPreviewInBrowser(ctx: ExtensionCommandContext, markdownOverride?: string, resourcePath?: string, isLatex?: boolean, fontSizePx?: number): Promise<void> {
+type BrowserThemePreference = "light" | "dark" | "auto";
+
+function applyBrowserThemeOverride(style: PreviewStyle, requestedTheme?: BrowserThemePreference): PreviewStyle {
+	if (requestedTheme === "dark") {
+		const palette = DARK_PREVIEW_PALETTE;
+		return { themeMode: "dark", palette, cacheKey: ["dark", ...Object.values(palette)].join("|") };
+	}
+	if (requestedTheme === "light") {
+		const palette = LIGHT_PREVIEW_PALETTE;
+		return { themeMode: "light", palette, cacheKey: ["light", ...Object.values(palette)].join("|") };
+	}
+	if (requestedTheme === "auto") {
+		return style;
+	}
+	// Default browser preview to light mode regardless of terminal theme
+	const palette = LIGHT_PREVIEW_PALETTE;
+	return { themeMode: "light", palette, cacheKey: ["light", ...Object.values(palette)].join("|") };
+}
+
+async function openPreviewInBrowser(ctx: ExtensionCommandContext, markdownOverride?: string, resourcePath?: string, isLatex?: boolean, fontSizePx?: number, requestedTheme?: BrowserThemePreference): Promise<void> {
 	const markdown = markdownOverride ?? getLastAssistantMarkdown(ctx);
 	if (!markdown) {
 		throw new Error("No assistant markdown found in the current branch.");
 	}
 
-	const style = getPreviewStyle(ctx.ui.theme);
+	const style = applyBrowserThemeOverride(getPreviewStyle(ctx.ui.theme), requestedTheme);
 	const { normalizedMarkdown, pandocMarkdown, annotationPlaceholders } = prepareBrowserPreviewMarkdown(markdown, isLatex);
-	const fragmentHtml = await renderMarkdownToHtmlWithPandoc(pandocMarkdown, resourcePath, isLatex);
+	const fragmentHtml = await renderMarkdownToHtmlWithPandoc(pandocMarkdown, resourcePath, isLatex, "mathjax");
 	const html = buildBrowserHtmlFromPandocFragment(fragmentHtml, style, resourcePath, annotationPlaceholders, fontSizePx);
 	const hash = createHash("sha256")
 		.update(RENDER_VERSION)
@@ -3571,6 +3617,97 @@ async function openPreviewInBrowser(ctx: ExtensionCommandContext, markdownOverri
 	await mkdir(CACHE_DIR, { recursive: true });
 	await writeFile(htmlPath, html, "utf-8");
 	await openFileInDefaultBrowser(htmlPath);
+}
+
+function formatPdfTimestamp(date: Date): string {
+	const pad = (n: number) => String(n).padStart(2, "0");
+	return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+}
+
+function getDefaultPdfOutputPath(ctx: ExtensionCommandContext, sourceFilePath?: string, out?: string, outDir?: string): string {
+	if (out) {
+		return resolvePath(ctx.cwd, out);
+	}
+	const dir = outDir ? resolvePath(ctx.cwd, outDir) : resolvePath(ctx.cwd, ".pi-markdown-preview");
+	const timestamp = formatPdfTimestamp(new Date());
+	const basenamePart = sourceFilePath ? basename(sourceFilePath, extname(sourceFilePath)) : "preview";
+	const fileName = `${timestamp}-${basenamePart}.pdf`;
+	return resolvePath(dir, fileName);
+}
+
+async function saveBrowserPdf(
+	ctx: ExtensionCommandContext,
+	markdownOverride?: string,
+	resourcePath?: string,
+	isLatex?: boolean,
+	fontSizePx?: number,
+	requestedTheme?: BrowserThemePreference,
+	outputPath?: string,
+): Promise<string> {
+	const markdown = markdownOverride ?? getLastAssistantMarkdown(ctx);
+	if (!markdown) {
+		throw new Error("No assistant markdown found in the current branch.");
+	}
+	if (!outputPath) {
+		throw new Error("Output path is required for PDF save.");
+	}
+
+	const terminalStyle = getPreviewStyle(ctx.ui.theme);
+	const style = applyBrowserThemeOverride(terminalStyle, requestedTheme);
+	const { normalizedMarkdown, pandocMarkdown, annotationPlaceholders } = prepareBrowserPreviewMarkdown(markdown, isLatex);
+	const fragmentHtml = await renderMarkdownToHtmlWithPandoc(pandocMarkdown, resourcePath, isLatex, "mathjax");
+	const html = buildBrowserHtmlFromPandocFragment(fragmentHtml, style, resourcePath, annotationPlaceholders, fontSizePx);
+
+	let browser: puppeteer.Browser | undefined;
+	let browserPage: puppeteer.Page | undefined;
+	let tempHtmlPath: string | undefined;
+
+	try {
+		const executablePath = findBrowserExecutable();
+		if (!executablePath) {
+			throw new Error(
+				"No Chromium-based browser was found. Set PUPPETEER_EXECUTABLE_PATH to your Chrome/Edge/Chromium binary.",
+			);
+		}
+
+		const args = ["--disable-gpu", "--font-render-hinting=medium"];
+		if (process.platform === "linux") {
+			args.push("--no-sandbox", "--disable-setuid-sandbox");
+		}
+
+		browser = await puppeteer.launch({ headless: true, executablePath, args });
+		browserPage = await browser.newPage();
+
+		await mkdir(CACHE_DIR, { recursive: true });
+		tempHtmlPath = join(CACHE_DIR, `_pdf_save_tmp_${Date.now()}.html`);
+		await writeFile(tempHtmlPath, html, "utf-8");
+
+		await browserPage.setViewport({
+			width: VIEWPORT_WIDTH_PX,
+			height: 900,
+			deviceScaleFactor: 1,
+		});
+
+		await browserPage.goto(pathToFileURL(tempHtmlPath).href, { waitUntil: "domcontentloaded" });
+		await waitForPageRenderReady(browserPage);
+		await browserPage.waitForFunction(
+			"window.__mermaidDone === true",
+			{ timeout: 15000 }
+		).catch(() => {});
+
+		await browserPage.pdf({
+			path: outputPath,
+			format: "A4",
+			printBackground: true,
+			preferCSSPageSize: false,
+		});
+
+		return outputPath;
+	} finally {
+		if (tempHtmlPath) await unlink(tempHtmlPath).catch(() => {});
+		if (browserPage) await browserPage.close().catch(() => {});
+		if (browser) await browser.close().catch(() => {});
+	}
 }
 
 function tokenizeArgs(input: string): string[] {
@@ -3618,13 +3755,16 @@ function parsePreviewFontSize(raw: string): { value?: number; error?: string } {
 	return { value: normalizePreviewFontSizePx(value) };
 }
 
-function parsePreviewArgs(args: string): { target?: PreviewTarget; pick?: boolean; file?: string; fontSizePx?: number; help?: boolean; error?: string } {
+function parsePreviewArgs(args: string): { target?: PreviewTarget; pick?: boolean; file?: string; fontSizePx?: number; theme?: BrowserThemePreference; out?: string; outDir?: string; help?: boolean; error?: string } {
 	const tokens = tokenizeArgs(args);
 	let target: PreviewTarget = "terminal";
 	let explicitTarget = false;
 	let pick = false;
 	let file: string | undefined;
 	let fontSizePx: number | undefined;
+	let theme: BrowserThemePreference | undefined;
+	let out: string | undefined;
+	let outDir: string | undefined;
 
 	for (let i = 0; i < tokens.length; i++) {
 		const token = tokens[i]!;
@@ -3665,6 +3805,40 @@ function parsePreviewArgs(args: string): { target?: PreviewTarget; pick?: boolea
 			const parsedFontSize = parsePreviewFontSize(fontSizeEquals[1]!);
 			if (parsedFontSize.error || parsedFontSize.value === undefined) return { error: parsedFontSize.error ?? "Invalid font size." };
 			fontSizePx = parsedFontSize.value;
+			continue;
+		}
+
+		if (token === "--theme") {
+			const next = tokens[i + 1];
+			if (!next || next.startsWith("-")) {
+				return { error: "Missing theme after --theme. Use light, dark, or auto." };
+			}
+			const lower = next.toLowerCase();
+			if (lower !== "light" && lower !== "dark" && lower !== "auto") {
+				return { error: `Invalid theme "${next}". Use light, dark, or auto.` };
+			}
+			theme = lower as BrowserThemePreference;
+			i++;
+			continue;
+		}
+
+		if (token === "--out") {
+			const next = tokens[i + 1];
+			if (!next || next.startsWith("-")) {
+				return { error: "Missing path after --out." };
+			}
+			out = next;
+			i++;
+			continue;
+		}
+
+		if (token === "--out-dir") {
+			const next = tokens[i + 1];
+			if (!next || next.startsWith("-")) {
+				return { error: "Missing directory after --out-dir." };
+			}
+			outDir = next;
+			i++;
 			continue;
 		}
 
@@ -3712,21 +3886,21 @@ function parsePreviewArgs(args: string): { target?: PreviewTarget; pick?: boolea
 			continue;
 		}
 
-		return { error: `Unknown argument \"${token}\". Use /preview [--pick|-p] [--file|-f <path>] [--browser] [--pdf] [--terminal] [--font-size <px>]` };
+		return { error: `Unknown argument \"${token}\". Use /preview [--pick|-p] [--file|-f <path>] [--browser] [--pdf] [--terminal] [--font-size <px>] [--theme light|dark|auto]` };
 	}
 
 	if (file && pick) {
 		return { error: "Cannot use --pick and --file together." };
 	}
 
-	return { target, pick, file, fontSizePx };
+	return { target, pick, file, fontSizePx, theme, out, outDir };
 }
 
 export default function (pi: ExtensionAPI) {
 	const run = async (args: string, ctx: ExtensionCommandContext) => {
 		const parsed = parsePreviewArgs(args);
 		if (parsed.help) {
-			ctx.ui.notify("Usage: /preview [--pick|-p] [--file|-f <path>] [--browser] [--pdf] [--terminal] [--font-size <px>]  or  /preview <path>", "info");
+			ctx.ui.notify("Usage: /preview [--pick|-p] [--file|-f <path>] [--browser] [--pdf] [--terminal] [--font-size <px>] [--theme light|dark|auto]  or  /preview <path>", "info");
 			return;
 		}
 		if (parsed.error || !parsed.target) {
@@ -3776,7 +3950,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (parsed.target === "browser") {
 			try {
-				await openPreviewInBrowser(ctx, markdown, resourcePath, isLatex, parsed.fontSizePx);
+				await openPreviewInBrowser(ctx, markdown, resourcePath, isLatex, parsed.fontSizePx, parsed.theme);
 				ctx.ui.notify("Opened preview in browser.", "info");
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
@@ -3801,12 +3975,12 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.registerCommand("preview", {
-		description: "Rendered markdown preview (--pick select response, --file <path> or bare path, --browser for HTML, --pdf for PDF, --terminal to force inline, --font-size <px>)",
+		description: "Rendered markdown preview (--pick select response, --file <path> or bare path, --browser for HTML, --pdf for PDF, --terminal to force inline, --font-size <px>, --theme light|dark|auto)",
 		handler: run,
 	});
 
 	pi.registerCommand("preview-browser", {
-		description: "Open rendered markdown + LaTeX preview in the default browser (MathML + selective MathJax fallback)",
+		description: "Open rendered markdown + LaTeX preview in the default browser (--theme light|dark|auto)",
 		handler: async (args, ctx) => {
 			await ctx.waitForIdle();
 			await run(`--browser ${args}`.trim(), ctx);
@@ -3819,6 +3993,78 @@ export default function (pi: ExtensionAPI) {
 			await ctx.waitForIdle();
 			// Re-use the main run handler with --pdf prepended
 			await run(`--pdf ${args}`.trim(), ctx);
+		},
+	});
+
+	pi.registerCommand("preview-pdf-save", {
+		description: "Save markdown preview as PDF via browser/Chromium (--theme light|dark|auto, --out <path>, --out-dir <dir>)",
+		handler: async (args, ctx) => {
+			await ctx.waitForIdle();
+
+			const parsed = parsePreviewArgs(args);
+			if (parsed.help) {
+				ctx.ui.notify("Usage: /preview-pdf-save [--theme light|dark|auto] [--out <path>] [--out-dir <dir>] [file]", "info");
+				return;
+			}
+			if (parsed.error) {
+				ctx.ui.notify(parsed.error, "error");
+				return;
+			}
+
+			let markdown: string | undefined;
+			let resourcePath: string | undefined;
+			let isLatex = false;
+			let sourceFilePath: string | undefined;
+
+			if (parsed.file) {
+				try {
+					const expanded = parsed.file.startsWith("~/") ? join(homedir(), parsed.file.slice(2))
+						: parsed.file === "~" ? homedir()
+						: parsed.file;
+					const filePath = resolvePath(ctx.cwd, expanded);
+					const fileContent = await readFile(filePath, "utf-8");
+					resourcePath = dirname(filePath);
+					sourceFilePath = filePath;
+					if (isLatexFile(filePath)) {
+						markdown = fileContent;
+						isLatex = true;
+					} else if (isMarkdownFile(filePath)) {
+						markdown = fileContent;
+					} else {
+						const lang = detectLanguageFromPath(filePath);
+						markdown = wrapCodeAsMarkdown(fileContent, lang, filePath);
+					}
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					ctx.ui.notify(`Failed to read file: ${message}`, "error");
+					return;
+				}
+			} else if (parsed.pick) {
+				const picked = await pickAssistantMessage(ctx);
+				if (picked === null) return;
+				markdown = picked;
+			}
+
+			const effectiveMarkdown = markdown ?? getLastAssistantMarkdown(ctx);
+			if (!effectiveMarkdown) {
+				ctx.ui.notify("No assistant markdown found in the current branch.", "warning");
+				return;
+			}
+			if (!resourcePath) {
+				resourcePath = ctx.cwd;
+			}
+
+			const outputPath = getDefaultPdfOutputPath(ctx, sourceFilePath, parsed.out, parsed.outDir);
+			await mkdir(dirname(outputPath), { recursive: true });
+
+			try {
+				ctx.ui.notify("Generating PDF via browser...", "info");
+				await saveBrowserPdf(ctx, markdown, resourcePath, isLatex, parsed.fontSizePx, parsed.theme, outputPath);
+				ctx.ui.notify(`Saved PDF: ${outputPath}`, "info");
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				ctx.ui.notify(`PDF save failed: ${message}`, "error");
+			}
 		},
 	});
 
