@@ -30,6 +30,7 @@ Preview adapts to your pi theme. Examples with a custom theme and the built-in d
 - **Terminal preview (default)** — renders markdown as PNG images displayed inline (Kitty, iTerm2, Ghostty, WezTerm). Long responses are automatically split across navigable pages.
 - **Browser preview** — opens rendered HTML in your default browser as a single continuous scrollable document
 - **PDF export** — exports markdown to PDF via pandoc + LaTeX and opens it in your default PDF viewer
+- **LLM-callable artifact export** — lets pi render the latest response, supplied Markdown/LaTeX, or a local file to PDF, HTML, or PNG files for remote/headless workflows such as Telegram delivery
 - **Mermaid diagrams** — renders ` ```mermaid` code blocks as SVG diagrams in terminal/browser previews, and as high-quality vector diagrams in PDF export when Mermaid CLI is available
 - **LaTeX/math support** — renders `$inline$`, `$$display$$`, `\(...\)`, and `\[...\]` math via MathML with selective MathJax fallback for pandoc-unsupported browser/terminal equations, or native LaTeX (PDF)
 - **Syntax highlighting** — fenced code blocks in markdown and standalone code files are rendered with theme-aware syntax colouring via pandoc. Supports 50+ languages including TypeScript, Python, Rust, Go, C/C++, Julia, and more.
@@ -84,6 +85,41 @@ pi -e https://github.com/omaclaren/pi-markdown-preview
 | `/preview --pick --browser` | Pick a response, open in browser |
 
 Local images are supported. File previews resolve relative image paths against the previewed file’s directory; assistant-response previews resolve them against pi’s current working directory. Absolute paths, `file:`, `http(s):`, and `data:` image URLs also work.
+
+### LLM-callable artifact export
+
+The extension also registers a `preview_export` tool that pi can call directly. It renders Markdown/LaTeX content, a local file, or the latest assistant response to artifact files and returns their paths instead of requiring an interactive terminal/browser preview.
+
+Supported formats:
+- `pdf` — writes a PDF file using the same pandoc + LaTeX path as `/preview-pdf`
+- `html` — writes a standalone rendered HTML preview
+- `png` — writes one PNG per rendered preview page, appending `-1-of-N`, `-2-of-N`, etc. for multi-page output
+
+The tool accepts optional `outputPath`, `fontSizePx`, `resourcePath`, and `open` arguments. By default it only writes files and returns paths, so another integration (for example Telegram or an upload/send-file tool) can deliver them.
+
+Example user requests pi can satisfy with `preview_export`:
+
+```text
+Make the last answer a PDF and send it to me.
+Render ./report.md as HTML.
+Export this markdown as PNG pages.
+```
+
+### Programmatic helper exports
+
+Other pi extensions can import the preview helpers directly:
+
+```ts
+import {
+  openPreview,
+  openPreviewInBrowser,
+  closeSharedPreviewBrowser,
+} from "pi-markdown-preview";
+```
+
+- `openPreview(ctx, markdownOverride?, resourcePath?, isLatex?, fontSizePx?)` opens the inline terminal preview.
+- `openPreviewInBrowser(ctx, markdownOverride?, resourcePath?, isLatex?, fontSizePx?)` writes and opens the browser HTML preview.
+- `closeSharedPreviewBrowser()` closes the shared headless Chromium instance used for terminal/PNG rendering. Importing extensions can call this from their own `session_shutdown` handler; the bundled extension also calls it on pi shutdown/reload/switch.
 
 Additional accepted argument aliases:
 - Pick: `-p`, `pick`
