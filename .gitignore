@@ -1,2 +1,4 @@
 node_modules/
+.test-dist/
+.test-dist-smoke/
 .DS_Store

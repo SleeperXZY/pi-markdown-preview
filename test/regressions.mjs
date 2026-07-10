@@ -5,7 +5,12 @@ import { resolve } from "node:path";
 
 const sourcePath = resolve(process.cwd(), "index.ts");
 const src = readFileSync(sourcePath, "utf-8");
+const packageJson = JSON.parse(readFileSync(resolve(process.cwd(), "package.json"), "utf-8"));
 
+assert.equal(packageJson.version, "0.10.0", "Package version should track upstream v0.10.0.");
+assert.equal(packageJson.dependencies.mathjax, "^3.2.2", "Local MathJax must remain a runtime dependency.");
+assert.equal(packageJson.peerDependencies.typebox, "*", "The upstream preview_export schema requires the bundled TypeBox peer.");
+assert.match(src, /const RENDER_VERSION = "v22";/, "Rendering changes should invalidate older cached artifacts.");
 assert.match(src, /function buildRenderCacheKey\s*\(/, "Missing buildRenderCacheKey helper.");
 assert.match(
 	src,
@@ -48,6 +53,12 @@ assert.ok(
 	"PDF preamble should make cosmetic heading/list packages optional.",
 );
 assert.ok(
+	src.includes(String.raw`\\IfFileExists{ctex.sty}`) &&
+		src.includes(String.raw`\\setCJKsansfont{Noto Sans CJK SC}`) &&
+		src.includes(String.raw`\\ifcsname ctexset\\endcsname`),
+	"Fork CJK support should remain optional and preserve CJK-aware heading formatting.",
+);
+assert.ok(
 	src.includes(String.raw`\\IfFileExists{varwidth.sty}`) && src.includes(String.raw`\\parbox{\\dimexpr\\linewidth-2\\fboxsep-2\\fboxrule\\relax}`),
 	"PDF annotation boxes should use varwidth when available and a parbox fallback otherwise.",
 );
@@ -87,6 +98,11 @@ assert.match(
 	src,
 	/resolvePath\(ctx\.cwd,\s*expanded\)/,
 	"--file paths should resolve against ctx.cwd.",
+);
+assert.match(
+	src,
+	/const withoutAtPrefix = rawPath\.startsWith\("@"\) \? rawPath\.slice\(1\) : rawPath;/,
+	"Tool and command paths should retain upstream leading-@ normalization.",
 );
 
 assert.match(
@@ -208,6 +224,22 @@ assert.ok(
 );
 assert.match(
 	src,
+	/function applyBrowserThemeOverride\(style: PreviewStyle, requestedTheme: BrowserThemePreference = "light"\)/,
+	"Browser previews should retain the fork's light default and explicit theme override.",
+);
+assert.match(
+	src,
+	/renderMarkdownToHtmlWithPandoc\(pandocMarkdown, resourcePath, isLatex, "mathjax"\)/,
+	"Browser HTML artifacts should ask Pandoc for MathJax-compatible output.",
+);
+assert.ok(
+	src.includes('./node_modules/mathjax/es5/tex-svg-full.js') &&
+		src.includes('mathJaxAssetMode: MathJaxAssetMode = "local-chtml"') &&
+		src.includes('outputPath, "inline-svg"'),
+	"HTML artifact export should embed local MathJax SVG support while interactive previews retain the lightweight local URL.",
+);
+assert.match(
+	src,
 	/const renderMathFallback = async \(root\) =>/,
 	"Expected targeted MathJax fallback for pandoc-unsupported preview equations.",
 );
@@ -215,6 +247,56 @@ assert.match(
 	src,
 	/await renderMermaid\(\);\s*applyPreviewAnnotationPlaceholders\(root\);\s*decorateDiffCodeBlocks\(root\);\s*await renderAnnotationMarkerMath\(root\);\s*await renderMathFallback\(root\);/s,
 	"Browser preview should apply preview placeholders, decorate diffs, render annotation math, then run general math fallback.",
+);
+
+assert.ok(
+	src.includes('name: "preview_export"') &&
+		src.includes('const PREVIEW_EXPORT_FORMATS = ["pdf", "html", "png"] as const;') &&
+		src.includes("resolvePreviewInput(ctx, params)"),
+	"Upstream preview_export support should remain registered for PDF, HTML, and PNG inputs.",
+);
+assert.ok(
+	src.includes("export async function openPreview(") &&
+		src.includes("export async function openPreviewInBrowser(") &&
+		src.includes("export async function closeSharedPreviewBrowser()"),
+	"Upstream programmatic preview helpers should remain exported.",
+);
+assert.ok(
+	src.includes("async function getSharedPreviewBrowser()") &&
+		src.includes("await closeSharedPreviewBrowser();") &&
+		src.includes("const browser = await getSharedPreviewBrowser();"),
+	"Terminal, PNG, and browser-PDF rendering should share Chromium and close it at session shutdown.",
+);
+assert.ok(
+	src.includes('Buffer.from(await browserPage.screenshot({ type: "png" }))') &&
+		src.includes("const pageScreenshot = Buffer.from(await browserPage.screenshot({"),
+	"Puppeteer Uint8Array screenshots must become Buffers before base64 encoding.",
+);
+assert.ok(
+	src.includes('pi.registerCommand("preview-pdf-save"') &&
+		src.includes("async function renderBrowserPdfToFile(") &&
+		src.includes("await page.pdf({"),
+	"The fork's Chromium PDF command should remain available on the upstream shared-browser pipeline.",
+);
+assert.ok(
+	src.includes('join(CACHE_DIR, `_browser_pdf_${randomUUID()}.html`)') &&
+		src.includes("await unlink(htmlPath).catch(() => {});"),
+	"Concurrent Chromium PDF jobs should use isolated temporary HTML files and clean them up.",
+);
+assert.ok(
+	src.includes("const milliseconds = String(date.getMilliseconds()).padStart(3, \"0\");") &&
+		src.includes("const uniqueSuffix = randomUUID().slice(0, 8);"),
+	"Default Chromium PDF destinations should be collision-resistant.",
+);
+assert.ok(
+	src.includes('return { error: "Use either --out or --out-dir, not both." };') &&
+		src.includes('return { error: "--theme is only supported for browser previews and /preview-pdf-save." };'),
+	"Fork-only output and theme options should reject ambiguous or inapplicable combinations.",
+);
+assert.ok(
+	src.includes('const defaultArtifactTheme: BrowserThemePreference = format === "html" ? "light" : "auto";') &&
+		src.includes("params.theme ?? defaultArtifactTheme"),
+	"HTML artifacts should default to the fork's light browser palette while PNG artifacts follow pi by default.",
 );
 
 const annotationFixture = await readFile(new URL("./annotation-markdownish.md", import.meta.url), "utf8");

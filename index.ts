@@ -1,5 +1,5 @@
 import { BorderedLoader, DynamicBorder, keyHint } from "@earendil-works/pi-coding-agent";
-import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import {
 	allocateImageId,
 	Container,
@@ -14,13 +14,14 @@ import {
 	type TUI,
 } from "@earendil-works/pi-tui";
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve as resolvePath } from "node:path";
 import { pathToFileURL } from "node:url";
 import puppeteer from "puppeteer-core";
+import { Type, type TUnsafe } from "typebox";
 import {
 	hasMarkdownAnnotationMarkers,
 	isAnnotationWordChar,
@@ -35,7 +36,7 @@ const CACHE_DIR = join(homedir(), ".pi", "cache", "markdown-preview");
 const MERMAID_PDF_CACHE_DIR = join(CACHE_DIR, "mermaid-pdf");
 const PREVIEW_ANNOTATION_PLACEHOLDER_PREFIX = "PIMDPREVIEWANNOT";
 const ANNOTATION_HELPERS_SOURCE = readFileSync(new URL("./client/annotation-helpers.js", import.meta.url), "utf-8");
-const RENDER_VERSION = "v21";
+const RENDER_VERSION = "v22";
 const DEFAULT_TERMINAL_PREVIEW_FONT_SIZE_PX = 16;
 const DEFAULT_BROWSER_PREVIEW_FONT_SIZE_PX = 15;
 const MIN_PREVIEW_FONT_SIZE_PX = 10;
@@ -50,8 +51,39 @@ const DEFAULT_PDF_RENDER_TIMEOUT_MS = 120000;
 const MIN_PDF_RENDER_TIMEOUT_MS = 10000;
 const MAX_PDF_RENDER_TIMEOUT_MS = 600000;
 
+function stringEnum<T extends readonly string[]>(values: T, options?: { description?: string; default?: T[number] }): TUnsafe<T[number]> {
+	return Type.Unsafe({
+		type: "string",
+		enum: values,
+		...(options?.description ? { description: options.description } : {}),
+		...(options?.default ? { default: options.default } : {}),
+	});
+}
+
 type ThemeMode = "dark" | "light";
 type PreviewTarget = "terminal" | "browser" | "pdf";
+type PreviewExportFormat = "pdf" | "html" | "png";
+type PreviewExportSource = "last_assistant" | "file" | "markdown";
+type PreviewInputFormat = "markdown" | "latex";
+export type BrowserThemePreference = "light" | "dark" | "auto";
+type PandocMathRenderer = "mathml" | "mathjax";
+type MathJaxAssetMode = "local-chtml" | "inline-svg";
+
+interface ParsedPreviewArgs {
+	target?: PreviewTarget;
+	pick?: boolean;
+	file?: string;
+	fontSizePx?: number;
+	theme?: BrowserThemePreference;
+	out?: string;
+	outDir?: string;
+	help?: boolean;
+	error?: string;
+}
+
+interface ParsePreviewArgsOptions {
+	allowPdfOutputOptions?: boolean;
+}
 
 interface PreviewPalette {
 	bg: string;
@@ -123,6 +155,67 @@ interface PreviewAnnotationPlaceholder {
 	text: string;
 	title: string;
 }
+
+interface ResolvedPreviewInput {
+	markdown: string;
+	resourcePath: string | undefined;
+	isLatex: boolean;
+	source: PreviewExportSource;
+	sourceDescription: string;
+}
+
+interface PreviewExportToolDetails {
+	format: PreviewExportFormat;
+	source: PreviewExportSource;
+	sourceDescription: string;
+	paths: string[];
+	mimeType: string;
+	opened: boolean;
+	openedPaths?: string[];
+	pageCount?: number;
+	truncatedPages?: boolean;
+	warnings?: string[];
+}
+
+const PREVIEW_EXPORT_FORMATS = ["pdf", "html", "png"] as const;
+const PREVIEW_EXPORT_SOURCES = ["last_assistant", "file", "markdown"] as const;
+const PREVIEW_INPUT_FORMATS = ["markdown", "latex"] as const;
+const BROWSER_THEME_PREFERENCES = ["light", "dark", "auto"] as const;
+
+const previewExportSchema = Type.Object({
+	format: stringEnum(PREVIEW_EXPORT_FORMATS, {
+		description: "Artifact format to produce: pdf, html, or png image page(s).",
+	}),
+	source: Type.Optional(stringEnum(PREVIEW_EXPORT_SOURCES, {
+		description: "Where the input content comes from. Defaults to markdown when markdown is provided, file when path is provided, otherwise last_assistant.",
+	})),
+	path: Type.Optional(Type.String({
+		description: "Source file path when source is file. Relative paths resolve against pi's current working directory. A leading @ is ignored.",
+	})),
+	markdown: Type.Optional(Type.String({
+		description: "Markdown or LaTeX content to render when source is markdown. Prefer this for content composed in the same assistant turn.",
+	})),
+	inputFormat: Type.Optional(stringEnum(PREVIEW_INPUT_FORMATS, {
+		description: "Interpret direct markdown content as markdown or latex. File inputs auto-detect .tex.",
+	})),
+	resourcePath: Type.Optional(Type.String({
+		description: "Base directory for resolving relative images/assets when source is markdown. Defaults to pi's current working directory.",
+	})),
+	outputPath: Type.Optional(Type.String({
+		description: "Optional destination path. Relative paths resolve against pi's current working directory. PNG exports with multiple pages append -1-of-N, -2-of-N, etc.",
+	})),
+	open: Type.Optional(Type.Boolean({
+		description: "Open the generated artifact locally after writing it. Defaults to false for headless/remote sessions.",
+	})),
+	fontSizePx: Type.Optional(Type.Number({
+		description: `Font size for HTML/PNG preview output, ${MIN_PREVIEW_FONT_SIZE_PX}-${MAX_PREVIEW_FONT_SIZE_PX}px.`,
+		minimum: MIN_PREVIEW_FONT_SIZE_PX,
+		maximum: MAX_PREVIEW_FONT_SIZE_PX,
+	})),
+	theme: Type.Optional(stringEnum(BROWSER_THEME_PREFERENCES, {
+		description: "Theme for HTML/PNG output. HTML defaults to light; PNG defaults to auto, which follows pi's current theme. LaTeX PDF output is unaffected.",
+	})),
+}, { additionalProperties: false });
 
 const DARK_PREVIEW_PALETTE: PreviewPalette = {
 	bg: "#0f1117",
@@ -718,13 +811,24 @@ function getPreviewStyle(theme?: Theme): PreviewStyle {
 	};
 }
 
+function applyBrowserThemeOverride(style: PreviewStyle, requestedTheme: BrowserThemePreference = "light"): PreviewStyle {
+	if (requestedTheme === "auto") return style;
+
+	const palette = requestedTheme === "dark" ? DARK_PREVIEW_PALETTE : LIGHT_PREVIEW_PALETTE;
+	return {
+		themeMode: requestedTheme,
+		palette,
+		cacheKey: [requestedTheme, ...Object.values(palette)].join("|"),
+	};
+}
+
 interface AssistantMessage {
 	index: number;
 	markdown: string;
 	preview: string;
 }
 
-function getAssistantMessages(ctx: ExtensionCommandContext): AssistantMessage[] {
+function getAssistantMessages(ctx: ExtensionContext): AssistantMessage[] {
 	const branch = ctx.sessionManager.getBranch();
 	const messages: AssistantMessage[] = [];
 	let messageIndex = 0;
@@ -748,9 +852,90 @@ function getAssistantMessages(ctx: ExtensionCommandContext): AssistantMessage[] 
 	return messages;
 }
 
-function getLastAssistantMarkdown(ctx: ExtensionCommandContext): string | undefined {
+function getLastAssistantMarkdown(ctx: ExtensionContext): string | undefined {
 	const messages = getAssistantMessages(ctx);
 	return messages.length > 0 ? messages[messages.length - 1]!.markdown : undefined;
+}
+
+function resolveUserPath(ctx: ExtensionContext, rawPath: string): string {
+	const withoutAtPrefix = rawPath.startsWith("@") ? rawPath.slice(1) : rawPath;
+	const expanded = withoutAtPrefix.startsWith("~/") ? join(homedir(), withoutAtPrefix.slice(2))
+		: withoutAtPrefix === "~" ? homedir()
+		: withoutAtPrefix;
+	return resolvePath(ctx.cwd, expanded);
+}
+
+async function resolvePreviewInput(
+	ctx: ExtensionContext,
+	options: {
+		source?: PreviewExportSource;
+		path?: string;
+		markdown?: string;
+		inputFormat?: PreviewInputFormat;
+		resourcePath?: string;
+	},
+): Promise<ResolvedPreviewInput> {
+	const source = options.source ?? (options.markdown !== undefined ? "markdown" : options.path ? "file" : "last_assistant");
+
+	if (source === "file") {
+		if (!options.path?.trim()) {
+			throw new Error("preview_export source=file requires path.");
+		}
+		const filePath = resolveUserPath(ctx, options.path);
+		const fileContent = await readFile(filePath, "utf-8");
+		if (isLatexFile(filePath)) {
+			return {
+				markdown: fileContent,
+				resourcePath: dirname(filePath),
+				isLatex: true,
+				source,
+				sourceDescription: filePath,
+			};
+		}
+		if (isMarkdownFile(filePath)) {
+			return {
+				markdown: fileContent,
+				resourcePath: dirname(filePath),
+				isLatex: false,
+				source,
+				sourceDescription: filePath,
+			};
+		}
+		return {
+			markdown: wrapCodeAsMarkdown(fileContent, detectLanguageFromPath(filePath), filePath),
+			resourcePath: dirname(filePath),
+			isLatex: false,
+			source,
+			sourceDescription: filePath,
+		};
+	}
+
+	if (source === "markdown") {
+		if (options.markdown === undefined || options.markdown.trim().length === 0) {
+			throw new Error("preview_export source=markdown requires markdown content.");
+		}
+		const resourcePath = options.resourcePath?.trim() ? resolveUserPath(ctx, options.resourcePath) : ctx.cwd;
+		const isLatex = options.inputFormat === "latex";
+		return {
+			markdown: options.markdown,
+			resourcePath,
+			isLatex,
+			source,
+			sourceDescription: isLatex ? "provided LaTeX" : "provided markdown",
+		};
+	}
+
+	const markdown = getLastAssistantMarkdown(ctx);
+	if (!markdown) {
+		throw new Error("No assistant markdown found in the current branch.");
+	}
+	return {
+		markdown,
+		resourcePath: ctx.cwd,
+		isLatex: false,
+		source,
+		sourceDescription: "latest assistant response",
+	};
 }
 
 function isLikelyMathExpression(expr: string): boolean {
@@ -1435,6 +1620,68 @@ function findBrowserExecutable(): string | undefined {
 	return getBrowserCandidates().find((candidate) => existsSync(candidate));
 }
 
+let sharedPreviewBrowser: puppeteer.Browser | undefined;
+let sharedPreviewBrowserLaunchPromise: Promise<puppeteer.Browser> | undefined;
+let sharedPreviewBrowserLaunchToken = 0;
+
+async function launchPreviewBrowser(): Promise<puppeteer.Browser> {
+	const executablePath = findBrowserExecutable();
+	if (!executablePath) {
+		throw new Error(
+			"No Chromium-based browser was found. Set PUPPETEER_EXECUTABLE_PATH to your Chrome/Edge/Chromium binary.",
+		);
+	}
+
+	const args = ["--disable-gpu", "--font-render-hinting=medium"];
+	if (process.platform === "linux") {
+		args.push("--no-sandbox", "--disable-setuid-sandbox");
+	}
+
+	return puppeteer.launch({ headless: true, executablePath, args });
+}
+
+async function getSharedPreviewBrowser(): Promise<puppeteer.Browser> {
+	if (sharedPreviewBrowser?.isConnected()) return sharedPreviewBrowser;
+	sharedPreviewBrowser = undefined;
+
+	if (sharedPreviewBrowserLaunchPromise) return sharedPreviewBrowserLaunchPromise;
+
+	const launchToken = ++sharedPreviewBrowserLaunchToken;
+	const launchPromise = (async () => {
+		const browser = await launchPreviewBrowser();
+		if (sharedPreviewBrowserLaunchToken !== launchToken) {
+			await browser.close().catch(() => {});
+			throw new Error("Preview browser launch cancelled.");
+		}
+
+		sharedPreviewBrowser = browser;
+		browser.once("disconnected", () => {
+			if (sharedPreviewBrowser === browser) sharedPreviewBrowser = undefined;
+		});
+		return browser;
+	})();
+
+	sharedPreviewBrowserLaunchPromise = launchPromise;
+	try {
+		return await launchPromise;
+	} finally {
+		if (sharedPreviewBrowserLaunchPromise === launchPromise) {
+			sharedPreviewBrowserLaunchPromise = undefined;
+		}
+	}
+}
+
+export async function closeSharedPreviewBrowser(): Promise<void> {
+	sharedPreviewBrowserLaunchToken++;
+	const browser = sharedPreviewBrowser;
+	const launchPromise = sharedPreviewBrowserLaunchPromise;
+	sharedPreviewBrowser = undefined;
+	sharedPreviewBrowserLaunchPromise = undefined;
+
+	await browser?.close().catch(() => {});
+	await launchPromise?.catch(() => {});
+}
+
 function getCachePaths(markdownPage: string, styleKey: string) {
 	const hash = createHash("sha256")
 		.update(RENDER_VERSION)
@@ -1549,26 +1796,14 @@ async function renderPreview(markdown: string, style: PreviewStyle, signal?: Abo
 	const fragmentHtml = await renderMarkdownToHtmlWithPandoc(pandocMarkdown, resourcePath, isLatex);
 	const html = buildBrowserHtmlFromPandocFragment(fragmentHtml, style, resourcePath, annotationPlaceholders, previewFontSizePx);
 
-	let browser: puppeteer.Browser | undefined;
 	let browserPage: puppeteer.Page | undefined;
 	let tempHtmlPath: string | undefined;
 
 	try {
 		if (signal?.aborted) throw new Error("Preview rendering cancelled.");
 
-		const executablePath = findBrowserExecutable();
-		if (!executablePath) {
-			throw new Error(
-				"No Chromium-based browser was found. Set PUPPETEER_EXECUTABLE_PATH to your Chrome/Edge/Chromium binary.",
-			);
-		}
-
-		const args = ["--disable-gpu", "--font-render-hinting=medium"];
-		if (process.platform === "linux") {
-			args.push("--no-sandbox", "--disable-setuid-sandbox");
-		}
-
-		browser = await puppeteer.launch({ headless: true, executablePath, args });
+		const browser = await getSharedPreviewBrowser();
+		if (signal?.aborted) throw new Error("Preview rendering cancelled.");
 		browserPage = await browser.newPage();
 
 		const loadHtml = async (height: number) => {
@@ -1610,7 +1845,7 @@ async function renderPreview(markdown: string, style: PreviewStyle, signal?: Abo
 		}
 
 		// Take full screenshot and slice into pages.
-		const fullScreenshot = (await browserPage.screenshot({ type: "png" })) as Buffer;
+		const fullScreenshot = Buffer.from(await browserPage.screenshot({ type: "png" }));
 
 		if (tempHtmlPath) await unlink(tempHtmlPath).catch(() => {});
 		tempHtmlPath = undefined;
@@ -1642,7 +1877,7 @@ async function renderPreview(markdown: string, style: PreviewStyle, signal?: Abo
 				const y = i * PAGE_HEIGHT_PX;
 				const height = Math.min(PAGE_HEIGHT_PX, renderHeight - y);
 
-				const pageScreenshot = (await browserPage.screenshot({
+				const pageScreenshot = Buffer.from(await browserPage.screenshot({
 					type: "png",
 					clip: {
 						x: 0,
@@ -1650,7 +1885,7 @@ async function renderPreview(markdown: string, style: PreviewStyle, signal?: Abo
 						width: VIEWPORT_WIDTH_PX,
 						height,
 					},
-				})) as Buffer;
+				}));
 
 				pages.push({
 					base64Png: pageScreenshot.toString("base64"),
@@ -1673,7 +1908,6 @@ async function renderPreview(markdown: string, style: PreviewStyle, signal?: Abo
 	} finally {
 		if (tempHtmlPath) await unlink(tempHtmlPath).catch(() => {});
 		if (browserPage) await browserPage.close().catch(() => {});
-		if (browser) await browser.close().catch(() => {});
 	}
 }
 
@@ -1968,7 +2202,7 @@ async function pickAssistantMessage(ctx: ExtensionCommandContext): Promise<strin
 	return selected ? selected.markdown : null;
 }
 
-async function openPreview(ctx: ExtensionCommandContext, markdownOverride?: string, resourcePath?: string, isLatex?: boolean, fontSizePx?: number): Promise<void> {
+export async function openPreview(ctx: ExtensionCommandContext, markdownOverride?: string, resourcePath?: string, isLatex?: boolean, fontSizePx?: number): Promise<void> {
 	const markdown = markdownOverride ?? getLastAssistantMarkdown(ctx);
 	if (!markdown) {
 		ctx.ui.notify("No assistant markdown found in the current branch.", "warning");
@@ -2005,7 +2239,7 @@ async function openPreview(ctx: ExtensionCommandContext, markdownOverride?: stri
 				return refreshed;
 			},
 			async () => {
-				await openPreviewInBrowser(ctx, markdown, resourcePath, isLatex, previewFontSizePx, undefined);
+				await openPreviewInBrowser(ctx, markdown, resourcePath, isLatex, previewFontSizePx);
 			},
 		),
 	);
@@ -2033,7 +2267,12 @@ async function openFileInDefaultBrowser(filePath: string): Promise<void> {
 	});
 }
 
-async function renderMarkdownToHtmlWithPandoc(markdown: string, resourcePath?: string, isLatex?: boolean, mathRenderer: "mathml" | "mathjax" = "mathml"): Promise<string> {
+async function renderMarkdownToHtmlWithPandoc(
+	markdown: string,
+	resourcePath?: string,
+	isLatex?: boolean,
+	mathRenderer: PandocMathRenderer = "mathml",
+): Promise<string> {
 	const pandocCommand = process.env.PANDOC_PATH?.trim() || "pandoc";
 	const pandocInput = isLatex ? markdown : normalizeMarkdownFencedBlocks(markdown);
 	const inputFormat = isLatex ? "latex" : "markdown+lists_without_preceding_blankline-blank_before_blockquote-blank_before_header+tex_math_dollars+autolink_bare_uris-raw_html";
@@ -2800,28 +3039,22 @@ async function preprocessMermaidForPdf(markdown: string): Promise<MermaidPdfPrep
 	};
 }
 
-async function exportPdf(ctx: ExtensionCommandContext, markdownOverride?: string, resourcePath?: string, isLatex?: boolean): Promise<void> {
-	const markdown = markdownOverride ?? getLastAssistantMarkdown(ctx);
-	if (!markdown) {
-		ctx.ui.notify("No assistant markdown found in the current branch.", "warning");
-		return;
-	}
-
+async function renderPreviewPdfToFile(
+	markdown: string,
+	outputPath?: string,
+	resourcePath?: string,
+	isLatex?: boolean,
+	onWarning?: (message: string) => void,
+): Promise<string> {
 	const normalizedMarkdown = isLatex
 		? markdown
 		: normalizeSubSupTags(normalizeMarkdownFencedBlocks(normalizeObsidianImages(normalizeMathDelimiters(markdown))));
 	const mermaidPrepared = isLatex ? { markdown: normalizedMarkdown, found: 0, replaced: 0, failed: 0, missingCli: false } : await preprocessMermaidForPdf(normalizedMarkdown);
 
 	if (mermaidPrepared.missingCli) {
-		ctx.ui.notify(
-			"Mermaid CLI (mmdc) not found; Mermaid blocks are kept as code in PDF. Install @mermaid-js/mermaid-cli or set MERMAID_CLI_PATH.",
-			"warning",
-		);
+		onWarning?.("Mermaid CLI (mmdc) not found; Mermaid blocks are kept as code in PDF. Install @mermaid-js/mermaid-cli or set MERMAID_CLI_PATH.");
 	} else if (mermaidPrepared.failed > 0) {
-		ctx.ui.notify(
-			`Failed to render ${mermaidPrepared.failed} Mermaid block${mermaidPrepared.failed === 1 ? "" : "s"} for PDF. Unrendered blocks are kept as code.`,
-			"warning",
-		);
+		onWarning?.(`Failed to render ${mermaidPrepared.failed} Mermaid block${mermaidPrepared.failed === 1 ? "" : "s"} for PDF. Unrendered blocks are kept as code.`);
 	}
 
 	const markdownForPdf = isLatex ? mermaidPrepared.markdown : highlightAnnotationMarkersForPdf(mermaidPrepared.markdown);
@@ -2830,11 +3063,13 @@ async function exportPdf(ctx: ExtensionCommandContext, markdownOverride?: string
 		.update("\u0000")
 		.update("pdf")
 		.update("\u0000")
+		.update(buildRenderCacheKey("pdf", resourcePath, isLatex))
+		.update("\u0000")
 		.update(markdownForPdf)
 		.digest("hex");
-	const pdfPath = join(CACHE_DIR, `${hash}.pdf`);
+	const pdfPath = outputPath ?? join(CACHE_DIR, `${hash}.pdf`);
 
-	await mkdir(CACHE_DIR, { recursive: true });
+	await mkdir(dirname(pdfPath), { recursive: true });
 	if (isLatex) {
 		await compileLatexToPdf(markdownForPdf, pdfPath, resourcePath);
 	} else if (hasMarkdownDiffFence(markdownForPdf)) {
@@ -2842,6 +3077,17 @@ async function exportPdf(ctx: ExtensionCommandContext, markdownOverride?: string
 	} else {
 		await renderMarkdownToPdf(markdownForPdf, pdfPath, resourcePath);
 	}
+	return pdfPath;
+}
+
+async function exportPdf(ctx: ExtensionCommandContext, markdownOverride?: string, resourcePath?: string, isLatex?: boolean): Promise<void> {
+	const markdown = markdownOverride ?? getLastAssistantMarkdown(ctx);
+	if (!markdown) {
+		ctx.ui.notify("No assistant markdown found in the current branch.", "warning");
+		return;
+	}
+
+	const pdfPath = await renderPreviewPdfToFile(markdown, undefined, resourcePath, isLatex, (message) => ctx.ui.notify(message, "warning"));
 	await openFileInDefaultBrowser(pdfPath);
 }
 
@@ -2935,6 +3181,7 @@ function buildBrowserHtmlFromPandocFragment(
 	resourcePath?: string,
 	annotationPlaceholders: PreviewAnnotationPlaceholder[] = [],
 	fontSizePx?: number,
+	mathJaxAssetMode: MathJaxAssetMode = "local-chtml",
 ): string {
 	const palette = style.palette;
 	const cssVarsBlock = Object.entries(buildPreviewCssVars(style, fontSizePx)).map(([key, value]) => `  ${key}: ${value};`).join("\n");
@@ -2962,7 +3209,12 @@ function buildBrowserHtmlFromPandocFragment(
 		},
 	};
 	const mermaidConfigJson = JSON.stringify(mermaidConfig).replace(/</g, "\\u003c");
-	const mathJaxScriptUrlJson = JSON.stringify(new URL("./node_modules/mathjax/es5/tex-chtml.js", import.meta.url).href).replace(/</g, "\\u003c");
+	const mathJaxScriptUrlJson = mathJaxAssetMode === "local-chtml"
+		? JSON.stringify(new URL("./node_modules/mathjax/es5/tex-chtml.js", import.meta.url).href).replace(/</g, "\\u003c")
+		: "null";
+	const mathJaxScriptSourceJson = mathJaxAssetMode === "inline-svg"
+		? JSON.stringify(readFileSync(new URL("./node_modules/mathjax/es5/tex-svg-full.js", import.meta.url), "utf-8")).replace(/</g, "\\u003c")
+		: "null";
 	const baseTag = resourcePath ? `\n<base href="${pathToFileURL(resourcePath + "/").href}" />` : "";
 	const annotationHelpersScript = ANNOTATION_HELPERS_SOURCE.replace(/<\/script/gi, "<\\/script");
 	const annotationPlaceholdersJson = JSON.stringify(annotationPlaceholders).replace(/</g, "\\u003c");
@@ -3359,6 +3611,7 @@ ${annotationHelpersScript}
     };
 
     const MATHJAX_SCRIPT_URL = ${mathJaxScriptUrlJson};
+    const MATHJAX_SCRIPT_SOURCE = ${mathJaxScriptSourceJson};
 
     const waitForFonts = async () => {
       if ('fonts' in document) {
@@ -3446,9 +3699,7 @@ ${annotationHelpersScript}
         };
 
         const script = document.createElement('script');
-        script.src = MATHJAX_SCRIPT_URL;
-        script.async = true;
-        script.onload = () => {
+        const finishLoading = () => {
           const api = window.MathJax;
           if (api && api.startup && api.startup.promise && typeof api.startup.promise.then === 'function') {
             api.startup.promise.then(() => resolve(api)).catch(reject);
@@ -3461,6 +3712,21 @@ ${annotationHelpersScript}
           reject(new Error('MathJax did not initialize.'));
         };
         script.onerror = () => reject(new Error('Failed to load MathJax.'));
+
+        if (MATHJAX_SCRIPT_SOURCE) {
+          script.textContent = MATHJAX_SCRIPT_SOURCE;
+          document.head.appendChild(script);
+          finishLoading();
+          return;
+        }
+        if (!MATHJAX_SCRIPT_URL) {
+          reject(new Error('MathJax asset is unavailable.'));
+          return;
+        }
+
+        script.src = MATHJAX_SCRIPT_URL;
+        script.async = true;
+        script.onload = finishLoading;
         document.head.appendChild(script);
       }).catch((error) => {
         mathJaxPromise = null;
@@ -3574,140 +3840,154 @@ ${annotationHelpersScript}
 </html>`;
 }
 
-type BrowserThemePreference = "light" | "dark" | "auto";
-
-function applyBrowserThemeOverride(style: PreviewStyle, requestedTheme?: BrowserThemePreference): PreviewStyle {
-	if (requestedTheme === "dark") {
-		const palette = DARK_PREVIEW_PALETTE;
-		return { themeMode: "dark", palette, cacheKey: ["dark", ...Object.values(palette)].join("|") };
-	}
-	if (requestedTheme === "light") {
-		const palette = LIGHT_PREVIEW_PALETTE;
-		return { themeMode: "light", palette, cacheKey: ["light", ...Object.values(palette)].join("|") };
-	}
-	if (requestedTheme === "auto") {
-		return style;
-	}
-	// Default browser preview to light mode regardless of terminal theme
-	const palette = LIGHT_PREVIEW_PALETTE;
-	return { themeMode: "light", palette, cacheKey: ["light", ...Object.values(palette)].join("|") };
-}
-
-async function openPreviewInBrowser(ctx: ExtensionCommandContext, markdownOverride?: string, resourcePath?: string, isLatex?: boolean, fontSizePx?: number, requestedTheme?: BrowserThemePreference): Promise<void> {
-	const markdown = markdownOverride ?? getLastAssistantMarkdown(ctx);
-	if (!markdown) {
-		throw new Error("No assistant markdown found in the current branch.");
-	}
-
-	const style = applyBrowserThemeOverride(getPreviewStyle(ctx.ui.theme), requestedTheme);
+async function renderPreviewHtmlToFile(
+	markdown: string,
+	style: PreviewStyle,
+	resourcePath?: string,
+	isLatex?: boolean,
+	fontSizePx?: number,
+	outputPath?: string,
+	mathJaxAssetMode: MathJaxAssetMode = "local-chtml",
+): Promise<string> {
+	const previewFontSizePx = normalizePreviewFontSizePx(fontSizePx, DEFAULT_BROWSER_PREVIEW_FONT_SIZE_PX);
 	const { normalizedMarkdown, pandocMarkdown, annotationPlaceholders } = prepareBrowserPreviewMarkdown(markdown, isLatex);
 	const fragmentHtml = await renderMarkdownToHtmlWithPandoc(pandocMarkdown, resourcePath, isLatex, "mathjax");
-	const html = buildBrowserHtmlFromPandocFragment(fragmentHtml, style, resourcePath, annotationPlaceholders, fontSizePx);
+	const html = buildBrowserHtmlFromPandocFragment(fragmentHtml, style, resourcePath, annotationPlaceholders, previewFontSizePx, mathJaxAssetMode);
 	const hash = createHash("sha256")
 		.update(RENDER_VERSION)
 		.update("\u0000")
 		.update("browser-native")
 		.update("\u0000")
+		.update(mathJaxAssetMode)
+		.update("\u0000")
 		.update(style.cacheKey)
+		.update("\u0000")
+		.update(`fontSize=${previewFontSizePx}`)
+		.update("\u0000")
+		.update(buildRenderCacheKey("html", resourcePath, isLatex))
 		.update("\u0000")
 		.update(normalizedMarkdown)
 		.digest("hex");
-	const htmlPath = join(CACHE_DIR, `${hash}.html`);
+	const htmlPath = outputPath ?? join(CACHE_DIR, `${hash}.html`);
 
-	await mkdir(CACHE_DIR, { recursive: true });
+	await mkdir(dirname(htmlPath), { recursive: true });
 	await writeFile(htmlPath, html, "utf-8");
-	await openFileInDefaultBrowser(htmlPath);
+	return htmlPath;
 }
 
-function formatPdfTimestamp(date: Date): string {
-	const pad = (n: number) => String(n).padStart(2, "0");
-	return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
-}
-
-function getDefaultPdfOutputPath(ctx: ExtensionCommandContext, sourceFilePath?: string, out?: string, outDir?: string): string {
-	if (out) {
-		return resolvePath(ctx.cwd, out);
-	}
-	const dir = outDir ? resolvePath(ctx.cwd, outDir) : resolvePath(ctx.cwd, ".pi-markdown-preview");
-	const timestamp = formatPdfTimestamp(new Date());
-	const basenamePart = sourceFilePath ? basename(sourceFilePath, extname(sourceFilePath)) : "preview";
-	const fileName = `${timestamp}-${basenamePart}.pdf`;
-	return resolvePath(dir, fileName);
-}
-
-async function saveBrowserPdf(
+export async function openPreviewInBrowser(
 	ctx: ExtensionCommandContext,
 	markdownOverride?: string,
 	resourcePath?: string,
 	isLatex?: boolean,
 	fontSizePx?: number,
 	requestedTheme?: BrowserThemePreference,
-	outputPath?: string,
-): Promise<string> {
+): Promise<void> {
 	const markdown = markdownOverride ?? getLastAssistantMarkdown(ctx);
 	if (!markdown) {
 		throw new Error("No assistant markdown found in the current branch.");
 	}
-	if (!outputPath) {
-		throw new Error("Output path is required for PDF save.");
-	}
 
-	const terminalStyle = getPreviewStyle(ctx.ui.theme);
-	const style = applyBrowserThemeOverride(terminalStyle, requestedTheme);
-	const { normalizedMarkdown, pandocMarkdown, annotationPlaceholders } = prepareBrowserPreviewMarkdown(markdown, isLatex);
-	const fragmentHtml = await renderMarkdownToHtmlWithPandoc(pandocMarkdown, resourcePath, isLatex, "mathjax");
-	const html = buildBrowserHtmlFromPandocFragment(fragmentHtml, style, resourcePath, annotationPlaceholders, fontSizePx);
+	const style = applyBrowserThemeOverride(getPreviewStyle(ctx.ui.theme), requestedTheme);
+	const htmlPath = await renderPreviewHtmlToFile(markdown, style, resourcePath, isLatex, fontSizePx);
+	await openFileInDefaultBrowser(htmlPath);
+}
 
-	let browser: puppeteer.Browser | undefined;
-	let browserPage: puppeteer.Page | undefined;
-	let tempHtmlPath: string | undefined;
+function formatPdfTimestamp(date: Date): string {
+	const pad = (value: number) => String(value).padStart(2, "0");
+	const milliseconds = String(date.getMilliseconds()).padStart(3, "0");
+	return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}-${milliseconds}`;
+}
+
+function getDefaultBrowserPdfOutputPath(
+	ctx: ExtensionContext,
+	sourceFilePath?: string,
+	out?: string,
+	outDir?: string,
+): string {
+	if (out) return resolveUserPath(ctx, out);
+
+	const directory = outDir ? resolveUserPath(ctx, outDir) : resolvePath(ctx.cwd, ".pi-markdown-preview");
+	const sourceName = sourceFilePath ? basename(sourceFilePath, extname(sourceFilePath)) : "preview";
+	const uniqueSuffix = randomUUID().slice(0, 8);
+	return join(directory, `${formatPdfTimestamp(new Date())}-${sourceName}-${uniqueSuffix}.pdf`);
+}
+
+async function renderBrowserPdfToFile(
+	markdown: string,
+	style: PreviewStyle,
+	outputPath: string,
+	resourcePath?: string,
+	isLatex?: boolean,
+	fontSizePx?: number,
+): Promise<string> {
+	const htmlPath = join(CACHE_DIR, `_browser_pdf_${randomUUID()}.html`);
+	let page: puppeteer.Page | undefined;
 
 	try {
-		const executablePath = findBrowserExecutable();
-		if (!executablePath) {
-			throw new Error(
-				"No Chromium-based browser was found. Set PUPPETEER_EXECUTABLE_PATH to your Chrome/Edge/Chromium binary.",
-			);
-		}
-
-		const args = ["--disable-gpu", "--font-render-hinting=medium"];
-		if (process.platform === "linux") {
-			args.push("--no-sandbox", "--disable-setuid-sandbox");
-		}
-
-		browser = await puppeteer.launch({ headless: true, executablePath, args });
-		browserPage = await browser.newPage();
-
-		await mkdir(CACHE_DIR, { recursive: true });
-		tempHtmlPath = join(CACHE_DIR, `_pdf_save_tmp_${Date.now()}.html`);
-		await writeFile(tempHtmlPath, html, "utf-8");
-
-		await browserPage.setViewport({
-			width: VIEWPORT_WIDTH_PX,
-			height: 900,
-			deviceScaleFactor: 1,
-		});
-
-		await browserPage.goto(pathToFileURL(tempHtmlPath).href, { waitUntil: "domcontentloaded" });
-		await waitForPageRenderReady(browserPage);
-		await browserPage.waitForFunction(
-			"window.__mermaidDone === true",
-			{ timeout: 15000 }
-		).catch(() => {});
-
-		await browserPage.pdf({
+		await renderPreviewHtmlToFile(markdown, style, resourcePath, isLatex, fontSizePx, htmlPath);
+		const browser = await getSharedPreviewBrowser();
+		page = await browser.newPage();
+		await mkdir(dirname(outputPath), { recursive: true });
+		await page.setViewport({ width: VIEWPORT_WIDTH_PX, height: 900, deviceScaleFactor: 1 });
+		await page.goto(pathToFileURL(htmlPath).href, { waitUntil: "domcontentloaded" });
+		await waitForPageRenderReady(page);
+		await page.waitForFunction("window.__mermaidDone === true", { timeout: 15000 }).catch(() => {});
+		await page.pdf({
 			path: outputPath,
 			format: "A4",
 			printBackground: true,
 			preferCSSPageSize: false,
 		});
-
 		return outputPath;
 	} finally {
-		if (tempHtmlPath) await unlink(tempHtmlPath).catch(() => {});
-		if (browserPage) await browserPage.close().catch(() => {});
-		if (browser) await browser.close().catch(() => {});
+		await page?.close().catch(() => {});
+		await unlink(htmlPath).catch(() => {});
 	}
+}
+
+function buildPagedPngOutputPaths(basePath: string, pageCount: number): string[] {
+	if (pageCount <= 1) return [basePath];
+	const extension = extname(basePath) || ".png";
+	const stem = extname(basePath) ? basePath.slice(0, -extension.length) : basePath;
+	return Array.from({ length: pageCount }, (_value, index) => `${stem}-${index + 1}-of-${pageCount}${extension}`);
+}
+
+async function renderPreviewPngFiles(
+	markdown: string,
+	style: PreviewStyle,
+	outputPath?: string,
+	resourcePath?: string,
+	isLatex?: boolean,
+	fontSizePx?: number,
+	signal?: AbortSignal,
+): Promise<{ paths: string[]; pageCount: number; truncatedPages: boolean; themeMode: ThemeMode }> {
+	const previewFontSizePx = normalizePreviewFontSizePx(fontSizePx, DEFAULT_TERMINAL_PREVIEW_FONT_SIZE_PX);
+	const preview = await renderPreview(markdown, style, signal, resourcePath, undefined, isLatex, previewFontSizePx);
+	const artifactKey = buildRenderCacheKey(`${style.cacheKey}|artifact=png|fontSize=${previewFontSizePx}|scale=${getTerminalDeviceScaleFactor()}`, resourcePath, isLatex);
+	const hash = createHash("sha256")
+		.update(RENDER_VERSION)
+		.update("\u0000")
+		.update("png-artifact")
+		.update("\u0000")
+		.update(artifactKey)
+		.update("\u0000")
+		.update(markdown)
+		.digest("hex");
+	const basePath = outputPath ?? join(CACHE_DIR, `${hash}.png`);
+	const paths = buildPagedPngOutputPaths(basePath, preview.pages.length);
+
+	await Promise.all(paths.map((filePath, index) => (async () => {
+		await mkdir(dirname(filePath), { recursive: true });
+		await writeFile(filePath, Buffer.from(preview.pages[index]!.base64Png, "base64"));
+	})()));
+
+	return {
+		paths,
+		pageCount: preview.pages.length,
+		truncatedPages: preview.truncatedPages || preview.pages.some((page) => page.truncatedHeight),
+		themeMode: preview.themeMode,
+	};
 }
 
 function tokenizeArgs(input: string): string[] {
@@ -3755,7 +4035,7 @@ function parsePreviewFontSize(raw: string): { value?: number; error?: string } {
 	return { value: normalizePreviewFontSizePx(value) };
 }
 
-function parsePreviewArgs(args: string): { target?: PreviewTarget; pick?: boolean; file?: string; fontSizePx?: number; theme?: BrowserThemePreference; out?: string; outDir?: string; help?: boolean; error?: string } {
+function parsePreviewArgs(args: string, options: ParsePreviewArgsOptions = {}): ParsedPreviewArgs {
 	const tokens = tokenizeArgs(args);
 	let target: PreviewTarget = "terminal";
 	let explicitTarget = false;
@@ -3813,31 +4093,25 @@ function parsePreviewArgs(args: string): { target?: PreviewTarget; pick?: boolea
 			if (!next || next.startsWith("-")) {
 				return { error: "Missing theme after --theme. Use light, dark, or auto." };
 			}
-			const lower = next.toLowerCase();
-			if (lower !== "light" && lower !== "dark" && lower !== "auto") {
+			const normalizedTheme = next.toLowerCase();
+			if (!BROWSER_THEME_PREFERENCES.includes(normalizedTheme as BrowserThemePreference)) {
 				return { error: `Invalid theme "${next}". Use light, dark, or auto.` };
 			}
-			theme = lower as BrowserThemePreference;
+			theme = normalizedTheme as BrowserThemePreference;
 			i++;
 			continue;
 		}
 
-		if (token === "--out") {
+		if (token === "--out" || token === "--out-dir") {
+			if (!options.allowPdfOutputOptions) {
+				return { error: `${token} is only supported by /preview-pdf-save.` };
+			}
 			const next = tokens[i + 1];
 			if (!next || next.startsWith("-")) {
-				return { error: "Missing path after --out." };
+				return { error: token === "--out" ? "Missing path after --out." : "Missing directory after --out-dir." };
 			}
-			out = next;
-			i++;
-			continue;
-		}
-
-		if (token === "--out-dir") {
-			const next = tokens[i + 1];
-			if (!next || next.startsWith("-")) {
-				return { error: "Missing directory after --out-dir." };
-			}
-			outDir = next;
+			if (token === "--out") out = next;
+			else outDir = next;
 			i++;
 			continue;
 		}
@@ -3892,11 +4166,21 @@ function parsePreviewArgs(args: string): { target?: PreviewTarget; pick?: boolea
 	if (file && pick) {
 		return { error: "Cannot use --pick and --file together." };
 	}
+	if (theme && target !== "browser" && !options.allowPdfOutputOptions) {
+		return { error: "--theme is only supported for browser previews and /preview-pdf-save." };
+	}
+	if (out && outDir) {
+		return { error: "Use either --out or --out-dir, not both." };
+	}
 
 	return { target, pick, file, fontSizePx, theme, out, outDir };
 }
 
 export default function (pi: ExtensionAPI) {
+	pi.on("session_shutdown", async () => {
+		await closeSharedPreviewBrowser();
+	});
+
 	const run = async (args: string, ctx: ExtensionCommandContext) => {
 		const parsed = parsePreviewArgs(args);
 		if (parsed.help) {
@@ -3915,10 +4199,7 @@ export default function (pi: ExtensionAPI) {
 		let isLatex = false;
 		if (parsed.file) {
 			try {
-				const expanded = parsed.file.startsWith("~/") ? join(homedir(), parsed.file.slice(2))
-					: parsed.file === "~" ? homedir()
-					: parsed.file;
-				const filePath = resolvePath(ctx.cwd, expanded);
+				const filePath = resolveUserPath(ctx, parsed.file);
 				const fileContent = await readFile(filePath, "utf-8");
 				resourcePath = dirname(filePath);
 				if (isLatexFile(filePath)) {
@@ -3974,6 +4255,95 @@ export default function (pi: ExtensionAPI) {
 		await openPreview(ctx, markdown, resourcePath, isLatex, parsed.fontSizePx);
 	};
 
+	pi.registerTool<typeof previewExportSchema, PreviewExportToolDetails | undefined>({
+		name: "preview_export",
+		label: "Preview Export",
+		description: "Render Markdown/LaTeX, a local file, or the latest assistant response to PDF, HTML, or PNG artifact files. Use for remote/headless/Telegram-style sessions where slash-command previews cannot display interactively.",
+		promptSnippet: "Export rendered Markdown/LaTeX previews as PDF, HTML, or PNG artifact files",
+		promptGuidelines: [
+			"Use preview_export when the user asks to turn the latest response, provided Markdown/LaTeX, or a local Markdown/LaTeX/code file into a PDF, HTML page, or image file.",
+			"If exporting content composed in the same assistant turn, preview_export should receive that content in its markdown parameter instead of relying on last_assistant.",
+			"preview_export returns local artifact paths; use another available sending/uploading tool to deliver those files to the user when requested.",
+		],
+		parameters: previewExportSchema,
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			if (signal?.aborted) {
+				return { content: [{ type: "text", text: "Preview export cancelled." }], details: undefined };
+			}
+
+			const input = await resolvePreviewInput(ctx, params);
+			const outputPath = params.outputPath?.trim() ? resolveUserPath(ctx, params.outputPath) : undefined;
+			const warnings: string[] = [];
+			const format = params.format;
+			const defaultArtifactTheme: BrowserThemePreference = format === "html" ? "light" : "auto";
+			const style = applyBrowserThemeOverride(getPreviewStyle(ctx.ui.theme), params.theme ?? defaultArtifactTheme);
+			const openedPaths: string[] = [];
+			let paths: string[] = [];
+			let pageCount: number | undefined;
+			let truncatedPages: boolean | undefined;
+
+			onUpdate?.({
+				content: [{ type: "text", text: `Rendering ${format.toUpperCase()} preview from ${input.sourceDescription}...` }],
+				details: undefined,
+			});
+
+			if (format === "pdf") {
+				const pdfPath = await renderPreviewPdfToFile(input.markdown, outputPath, input.resourcePath, input.isLatex, (message) => {
+					warnings.push(message);
+					onUpdate?.({ content: [{ type: "text", text: message }], details: undefined });
+				});
+				paths = [pdfPath];
+			} else if (format === "html") {
+				const htmlPath = await renderPreviewHtmlToFile(input.markdown, style, input.resourcePath, input.isLatex, params.fontSizePx, outputPath, "inline-svg");
+				paths = [htmlPath];
+			} else {
+				const pngResult = await renderPreviewPngFiles(input.markdown, style, outputPath, input.resourcePath, input.isLatex, params.fontSizePx, signal);
+				paths = pngResult.paths;
+				pageCount = pngResult.pageCount;
+				truncatedPages = pngResult.truncatedPages;
+			}
+
+			if (params.open && paths.length > 0) {
+				const toOpen = format === "png" ? [paths[0]!] : paths;
+				for (const filePath of toOpen) {
+					await openFileInDefaultBrowser(filePath);
+					openedPaths.push(filePath);
+				}
+			}
+
+			const mimeType = format === "pdf" ? "application/pdf" : format === "html" ? "text/html" : "image/png";
+			const details: PreviewExportToolDetails = {
+				format,
+				source: input.source,
+				sourceDescription: input.sourceDescription,
+				paths,
+				mimeType,
+				opened: openedPaths.length > 0,
+				...(openedPaths.length > 0 ? { openedPaths } : {}),
+				...(pageCount !== undefined ? { pageCount } : {}),
+				...(truncatedPages !== undefined ? { truncatedPages } : {}),
+				...(warnings.length > 0 ? { warnings } : {}),
+			};
+
+			const title = format === "png" && paths.length > 1 ? `Exported PNG preview pages (${paths.length})` : `Exported ${format.toUpperCase()} preview`;
+			const lines = [
+				`${title} from ${input.sourceDescription}.`,
+				...paths.map((filePath) => `- ${filePath}`),
+			];
+			if (openedPaths.length > 0) {
+				lines.push(`Opened ${openedPaths.length === 1 ? "artifact" : "artifacts"}: ${openedPaths.join(", ")}`);
+			}
+			if (warnings.length > 0) {
+				lines.push("Warnings:", ...warnings.map((warning) => `- ${warning}`));
+			}
+
+			return {
+				content: [{ type: "text", text: lines.join("\n") }],
+				details,
+			};
+		},
+	});
+
 	pi.registerCommand("preview", {
 		description: "Rendered markdown preview (--pick select response, --file <path> or bare path, --browser for HTML, --pdf for PDF, --terminal to force inline, --font-size <px>, --theme light|dark|auto)",
 		handler: run,
@@ -3999,11 +4369,9 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("preview-pdf-save", {
 		description: "Save markdown preview as PDF via browser/Chromium (--theme light|dark|auto, --out <path>, --out-dir <dir>)",
 		handler: async (args, ctx) => {
-			await ctx.waitForIdle();
-
-			const parsed = parsePreviewArgs(args);
+			const parsed = parsePreviewArgs(args, { allowPdfOutputOptions: true });
 			if (parsed.help) {
-				ctx.ui.notify("Usage: /preview-pdf-save [--theme light|dark|auto] [--out <path>] [--out-dir <dir>] [file]", "info");
+				ctx.ui.notify("Usage: /preview-pdf-save [--pick|-p] [--file|-f <path>] [--font-size <px>] [--theme light|dark|auto] [--out <path> | --out-dir <dir>] [file]", "info");
 				return;
 			}
 			if (parsed.error) {
@@ -4011,55 +4379,38 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			let markdown: string | undefined;
-			let resourcePath: string | undefined;
-			let isLatex = false;
+			await ctx.waitForIdle();
+
+			let input: ResolvedPreviewInput;
 			let sourceFilePath: string | undefined;
-
-			if (parsed.file) {
-				try {
-					const expanded = parsed.file.startsWith("~/") ? join(homedir(), parsed.file.slice(2))
-						: parsed.file === "~" ? homedir()
-						: parsed.file;
-					const filePath = resolvePath(ctx.cwd, expanded);
-					const fileContent = await readFile(filePath, "utf-8");
-					resourcePath = dirname(filePath);
-					sourceFilePath = filePath;
-					if (isLatexFile(filePath)) {
-						markdown = fileContent;
-						isLatex = true;
-					} else if (isMarkdownFile(filePath)) {
-						markdown = fileContent;
-					} else {
-						const lang = detectLanguageFromPath(filePath);
-						markdown = wrapCodeAsMarkdown(fileContent, lang, filePath);
-					}
-				} catch (error) {
-					const message = error instanceof Error ? error.message : String(error);
-					ctx.ui.notify(`Failed to read file: ${message}`, "error");
-					return;
+			try {
+				if (parsed.file) {
+					input = await resolvePreviewInput(ctx, { source: "file", path: parsed.file });
+					sourceFilePath = input.sourceDescription;
+				} else if (parsed.pick) {
+					const picked = await pickAssistantMessage(ctx);
+					if (picked === null) return;
+					input = {
+						markdown: picked,
+						resourcePath: ctx.cwd,
+						isLatex: false,
+						source: "markdown",
+						sourceDescription: "selected assistant response",
+					};
+				} else {
+					input = await resolvePreviewInput(ctx, { source: "last_assistant" });
 				}
-			} else if (parsed.pick) {
-				const picked = await pickAssistantMessage(ctx);
-				if (picked === null) return;
-				markdown = picked;
-			}
-
-			const effectiveMarkdown = markdown ?? getLastAssistantMarkdown(ctx);
-			if (!effectiveMarkdown) {
-				ctx.ui.notify("No assistant markdown found in the current branch.", "warning");
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				ctx.ui.notify(`Failed to resolve preview input: ${message}`, "error");
 				return;
 			}
-			if (!resourcePath) {
-				resourcePath = ctx.cwd;
-			}
 
-			const outputPath = getDefaultPdfOutputPath(ctx, sourceFilePath, parsed.out, parsed.outDir);
-			await mkdir(dirname(outputPath), { recursive: true });
-
+			const outputPath = getDefaultBrowserPdfOutputPath(ctx, sourceFilePath, parsed.out, parsed.outDir);
+			const style = applyBrowserThemeOverride(getPreviewStyle(ctx.ui.theme), parsed.theme);
 			try {
 				ctx.ui.notify("Generating PDF via browser...", "info");
-				await saveBrowserPdf(ctx, markdown, resourcePath, isLatex, parsed.fontSizePx, parsed.theme, outputPath);
+				await renderBrowserPdfToFile(input.markdown, style, outputPath, input.resourcePath, input.isLatex, parsed.fontSizePx);
 				ctx.ui.notify(`Saved PDF: ${outputPath}`, "info");
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
