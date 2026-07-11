@@ -1,4 +1,5 @@
 node_modules/
 .test-dist/
 .test-dist-smoke/
+.test-dist-cancellation/
 .DS_Store

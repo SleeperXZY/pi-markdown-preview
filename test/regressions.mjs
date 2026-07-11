@@ -229,7 +229,7 @@ assert.match(
 );
 assert.match(
 	src,
-	/renderMarkdownToHtmlWithPandoc\(pandocMarkdown, resourcePath, isLatex, "mathjax"\)/,
+	/renderMarkdownToHtmlWithPandoc\(pandocMarkdown, resourcePath, isLatex, "mathjax", signal\)/,
 	"Browser HTML artifacts should ask Pandoc for MathJax-compatible output.",
 );
 assert.ok(
@@ -252,7 +252,7 @@ assert.match(
 assert.ok(
 	src.includes('name: "preview_export"') &&
 		src.includes('const PREVIEW_EXPORT_FORMATS = ["pdf", "html", "png"] as const;') &&
-		src.includes("resolvePreviewInput(ctx, params)"),
+		src.includes("resolvePreviewInput(ctx, params, signal)"),
 	"Upstream preview_export support should remain registered for PDF, HTML, and PNG inputs.",
 );
 assert.ok(
@@ -294,9 +294,48 @@ assert.ok(
 	"Fork-only output and theme options should reject ambiguous or inapplicable combinations.",
 );
 assert.ok(
+	src.includes("function normalizeArtifactOutputPath(") &&
+		src.includes("must use the ${expectedExtension} extension") &&
+		src.includes("normalizeArtifactOutputPath(resolveUserPath(ctx, params.outputPath), format)"),
+	"Artifact output paths should append missing extensions and reject mismatches.",
+);
+assert.ok(
+	src.includes("Unterminated ${quote === '\"' ? \"double\" : \"single\"} quote.") &&
+		src.includes("const outputEquals = token.match(/^--(out|out-dir)=(.*)$/);") &&
+		src.includes('if (token === "--")'),
+	"Command arguments should detect malformed quotes and support equals forms plus the option terminator.",
+);
+assert.ok(
 	src.includes('const defaultArtifactTheme: BrowserThemePreference = format === "html" ? "light" : "auto";') &&
 		src.includes("params.theme ?? defaultArtifactTheme"),
 	"HTML artifacts should default to the fork's light browser palette while PNG artifacts follow pi by default.",
+);
+assert.ok(
+	src.includes("class PreviewExportCancelledError extends Error") &&
+		src.includes("function attachAbortToChildProcess(") &&
+		src.includes('process.kill(-child.pid, force ? "SIGKILL" : "SIGTERM")') &&
+		src.includes("terminateWindowsProcessTreeWithPowerShell(") &&
+		src.includes("if (isPreviewExportCancellation(error, signal)) return cancellationResult();"),
+	"Artifact cancellation should terminate subprocess trees and return a cancellation result.",
+);
+assert.ok(
+	src.includes('import crossSpawn from "cross-spawn";') &&
+		src.includes("crossSpawn(mermaidCommand, args, {") &&
+		src.includes("crossSpawn(pandocCommand, args, {"),
+	"Rendering commands should use a shell-free launcher that supports Windows npm shims.",
+);
+assert.equal(
+	(src.match(/error\.code === "EPIPE"/g) ?? []).length,
+	4,
+	"Every rendering subprocess stdin stream should handle EPIPE during cancellation.",
+);
+assert.ok(
+	src.includes("const temporaryPath = join(dirname(pdfPath)") &&
+		src.includes("const temporaryPath = join(dirname(htmlPath)") &&
+		src.includes("const temporaryPaths = paths.map(") &&
+		src.includes("await withArtifactPublicationLocks(destinationPaths, async () => {") &&
+		src.includes("await publishStagedFiles(temporaryPaths, paths);"),
+	"PDF, HTML, and PNG exports should stage output before replacing final artifacts.",
 );
 
 const annotationFixture = await readFile(new URL("./annotation-markdownish.md", import.meta.url), "utf8");

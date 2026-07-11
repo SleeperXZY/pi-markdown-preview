@@ -10,7 +10,7 @@ const testDir = dirname(fileURLToPath(import.meta.url));
 const rootDir = resolve(testDir, "..");
 const compiledDir = join(rootDir, ".test-dist-smoke");
 const artifactsDir = await mkdtemp(join(tmpdir(), "pi-markdown-preview-smoke-"));
-const tscExecutable = join(rootDir, "node_modules", ".bin", process.platform === "win32" ? "tsc.cmd" : "tsc");
+const tscScript = join(rootDir, "node_modules", "typescript", "bin", "tsc");
 
 function requireCommand(command, args = ["--version"]) {
 	const result = spawnSync(command, args, { encoding: "utf-8" });
@@ -51,8 +51,8 @@ function findBrowserExecutable() {
 async function compileExtension() {
 	await rm(compiledDir, { recursive: true, force: true });
 	const result = spawnSync(
-		tscExecutable,
-		["-p", join(rootDir, "tsconfig.json"), "--noEmit", "false", "--outDir", compiledDir, "--declaration", "false"],
+		process.execPath,
+		[tscScript, "-p", join(rootDir, "tsconfig.json"), "--noEmit", "false", "--outDir", compiledDir, "--declaration", "false"],
 		{ cwd: rootDir, encoding: "utf-8" },
 	);
 	if (result.status !== 0) {
@@ -107,12 +107,13 @@ try {
 	assert.ok(tool, "preview_export should be registered.");
 
 	const markdown = `# Render smoke\n\nInline math: $x^2 + y^2 = z^2$.\n\n中文测试。\n\nCache-buster: ${Date.now()}\n\n\`\`\`ts\nconst answer: number = 42;\n\`\`\`\n`;
-	const htmlPath = join(artifactsDir, "artifact.html");
+	const htmlBasePath = join(artifactsDir, "artifact");
+	const htmlPath = `${htmlBasePath}.html`;
 	const htmlResult = await tool.execute("html-smoke", {
 		format: "html",
 		source: "markdown",
 		markdown,
-		outputPath: htmlPath,
+		outputPath: htmlBasePath,
 	}, undefined, undefined, ctx);
 	assert.deepEqual(htmlResult.details.paths, [htmlPath]);
 	const html = await readFile(htmlPath, "utf-8");
@@ -142,26 +143,48 @@ try {
 	await directBrowser.close();
 	directBrowser = undefined;
 
-	const pngPath = join(artifactsDir, "artifact.png");
+	const pngBasePath = join(artifactsDir, "artifact-image");
 	const pngResult = await tool.execute("png-smoke", {
 		format: "png",
 		source: "markdown",
 		markdown,
-		outputPath: pngPath,
+		outputPath: pngBasePath,
 		theme: "dark",
 	}, undefined, undefined, ctx);
-	assert.ok(pngResult.details.paths.length >= 1);
+	assert.deepEqual(pngResult.details.paths, [`${pngBasePath}.png`]);
 	for (const path of pngResult.details.paths) {
 		const png = await readFile(path);
 		assert.equal(png.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
 	}
 
-	const latexPdfPath = join(artifactsDir, "artifact-latex.pdf");
+	const sharedPngBasePath = join(artifactsDir, "shared-artifact");
+	const concurrentPngResults = await Promise.all([
+		tool.execute("png-concurrent-a", {
+			format: "png",
+			source: "markdown",
+			markdown: `${markdown}\n\nConcurrent A`,
+			outputPath: sharedPngBasePath,
+		}, undefined, undefined, ctx),
+		tool.execute("png-concurrent-b", {
+			format: "png",
+			source: "markdown",
+			markdown: `${markdown}\n\nConcurrent B`,
+			outputPath: sharedPngBasePath,
+		}, undefined, undefined, ctx),
+	]);
+	assert.deepEqual(concurrentPngResults.map((result) => result.details.paths), [
+		[`${sharedPngBasePath}.png`],
+		[`${sharedPngBasePath}.png`],
+	]);
+	assert.equal((await readFile(`${sharedPngBasePath}.png`)).subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
+
+	const latexPdfBasePath = join(artifactsDir, "artifact-latex");
+	const latexPdfPath = `${latexPdfBasePath}.pdf`;
 	const pdfResult = await tool.execute("pdf-smoke", {
 		format: "pdf",
 		source: "markdown",
 		markdown,
-		outputPath: latexPdfPath,
+		outputPath: latexPdfBasePath,
 	}, undefined, undefined, ctx);
 	assert.deepEqual(pdfResult.details.paths, [latexPdfPath]);
 	assert.equal((await readFile(latexPdfPath)).subarray(0, 5).toString(), "%PDF-");
@@ -170,11 +193,36 @@ try {
 		assert.match(extractedPdf.stdout, /中文测试/);
 	}
 
-	const sourcePath = join(artifactsDir, "source.md");
+	const diffPdfPath = join(artifactsDir, "artifact-diff.pdf");
+	const diffPdfResult = await tool.execute("diff-pdf-smoke", {
+		format: "pdf",
+		source: "markdown",
+		markdown: "# Diff\n\n```diff\n-old value\n+new value\n```\n",
+		outputPath: diffPdfPath,
+	}, undefined, undefined, ctx);
+	assert.deepEqual(diffPdfResult.details.paths, [diffPdfPath]);
+	assert.equal((await readFile(diffPdfPath)).subarray(0, 5).toString(), "%PDF-");
+
+	const rawLatexPdfPath = join(artifactsDir, "artifact-raw-latex.pdf");
+	const rawLatexPdfResult = await tool.execute("raw-latex-pdf-smoke", {
+		format: "pdf",
+		source: "markdown",
+		inputFormat: "latex",
+		markdown: String.raw`\documentclass{article}
+\begin{document}
+Raw \LaTeX{} smoke: $x^2$.
+\end{document}`,
+		outputPath: rawLatexPdfPath,
+	}, undefined, undefined, ctx);
+	assert.deepEqual(rawLatexPdfResult.details.paths, [rawLatexPdfPath]);
+	assert.equal((await readFile(rawLatexPdfPath)).subarray(0, 5).toString(), "%PDF-");
+
+	const sourceFileName = "source file.md";
+	const sourcePath = join(artifactsDir, sourceFileName);
 	await writeFile(sourcePath, markdown, "utf-8");
 	await Promise.all([
-		commands.get("preview-pdf-save").handler(`--theme dark "${sourcePath}"`, ctx),
-		commands.get("preview-pdf-save").handler(`--theme dark "${sourcePath}"`, ctx),
+		commands.get("preview-pdf-save").handler(`--theme=dark --file="${sourceFileName}"`, ctx),
+		commands.get("preview-pdf-save").handler(`--theme=dark --file=source\\ file.md`, ctx),
 	]);
 	const browserPdfPaths = notifications
 		.filter(({ message, level }) => level === "info" && message.startsWith("Saved PDF: "))
@@ -182,11 +230,12 @@ try {
 	assert.equal(browserPdfPaths.length, 2);
 	assert.equal(new Set(browserPdfPaths).size, 2, "Concurrent default PDF saves should use distinct destinations.");
 	for (const browserPdfPath of browserPdfPaths) {
-		assert.match(browserPdfPath, /\/\.pi-markdown-preview\/\d{8}-\d{6}-\d{3}-source-[0-9a-f]{8}\.pdf$/);
+		const normalizedBrowserPdfPath = browserPdfPath.replaceAll("\\", "/");
+		assert.match(normalizedBrowserPdfPath, /\/\.pi-markdown-preview\/\d{8}-\d{6}-\d{3}-source file-[0-9a-f]{8}\.pdf$/);
 		assert.equal((await readFile(browserPdfPath)).subarray(0, 5).toString(), "%PDF-");
 	}
 
-	console.log("Render smoke checks passed: portable HTML, PNG, LaTeX PDF, and concurrent Chromium PDFs.");
+	console.log("Render smoke checks passed: portable HTML, concurrent PNG, all LaTeX PDF pipelines, and concurrent Chromium PDFs.");
 } finally {
 	await directBrowser?.close().catch(() => {});
 	for (const handler of shutdownHandlers) await handler({}, { cwd: artifactsDir }).catch(() => {});

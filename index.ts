@@ -13,10 +13,11 @@ import {
 	Text,
 	type TUI,
 } from "@earendil-works/pi-tui";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import crossSpawn from "cross-spawn";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve as resolvePath } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -50,6 +51,124 @@ const MAX_RENDER_HEIGHT_PX = 66000; // PAGE_HEIGHT_PX * 30
 const DEFAULT_PDF_RENDER_TIMEOUT_MS = 120000;
 const MIN_PDF_RENDER_TIMEOUT_MS = 10000;
 const MAX_PDF_RENDER_TIMEOUT_MS = 600000;
+
+class PreviewExportCancelledError extends Error {
+	constructor() {
+		super("Preview export cancelled.");
+		this.name = "AbortError";
+	}
+}
+
+function throwIfPreviewAborted(signal?: AbortSignal): void {
+	if (signal?.aborted) throw new PreviewExportCancelledError();
+}
+
+function isPreviewExportCancellation(error: unknown, signal?: AbortSignal): boolean {
+	return signal?.aborted === true || error instanceof PreviewExportCancelledError || (error instanceof Error && error.name === "AbortError");
+}
+
+function terminateWindowsProcessTreeWithPowerShell(rootPid: number, child: ChildProcess, force: boolean): void {
+	const script = [
+		`$rootPid = ${rootPid}`,
+		"$processes = Get-CimInstance Win32_Process",
+		"$ids = New-Object 'System.Collections.Generic.List[int]'",
+		"$ids.Add($rootPid)",
+		"for ($i = 0; $i -lt $ids.Count; $i++) {",
+		"  $parentId = $ids[$i]",
+		"  foreach ($process in $processes) {",
+		"    $processId = [int]$process.ProcessId",
+		"    if ([int]$process.ParentProcessId -eq $parentId -and -not $ids.Contains($processId)) { $ids.Add($processId) }",
+		"  }",
+		"}",
+		"for ($i = $ids.Count - 1; $i -ge 0; $i--) { Stop-Process -Id $ids[$i] -Force -ErrorAction SilentlyContinue }",
+	].join("\n");
+	const powershell = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+		stdio: "ignore",
+		windowsHide: true,
+	});
+	const directFallback = () => child.kill(force ? "SIGKILL" : "SIGTERM");
+	powershell.once("error", directFallback);
+	powershell.once("close", (code) => {
+		if (code !== 0) directFallback();
+	});
+	powershell.unref();
+}
+
+function terminateChildProcessTree(child: ChildProcess, force = false): void {
+	if (!child.pid) {
+		child.kill(force ? "SIGKILL" : "SIGTERM");
+		return;
+	}
+
+	if (process.platform === "win32") {
+		const args = ["/PID", String(child.pid), "/T", "/F"];
+		const taskkill = spawn("taskkill", args, { stdio: "ignore", windowsHide: true });
+		let fallbackTimer: NodeJS.Timeout | undefined;
+		let fallbackStarted = false;
+		const fallback = () => {
+			if (fallbackTimer) clearTimeout(fallbackTimer);
+			if (fallbackStarted) return;
+			fallbackStarted = true;
+			terminateWindowsProcessTreeWithPowerShell(child.pid!, child, force);
+		};
+		taskkill.once("error", fallback);
+		taskkill.once("close", (code) => {
+			if (fallbackTimer) clearTimeout(fallbackTimer);
+			if (code !== 0) fallback();
+		});
+		fallbackTimer = setTimeout(fallback, 1000);
+		fallbackTimer.unref?.();
+		taskkill.unref();
+		return;
+	}
+
+	try {
+		process.kill(-child.pid, force ? "SIGKILL" : "SIGTERM");
+	} catch {
+		child.kill(force ? "SIGKILL" : "SIGTERM");
+	}
+}
+
+async function terminateChildProcessTreeAndWait(child: ChildProcess, force = false, timeoutMs = 1500): Promise<void> {
+	if (child.exitCode !== null || child.signalCode !== null) return;
+	await new Promise<void>((resolve) => {
+		let settled = false;
+		const finish = () => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timeout);
+			child.off("close", finish);
+			resolve();
+		};
+		const timeout = setTimeout(finish, timeoutMs);
+		timeout.unref?.();
+		child.once("close", finish);
+		terminateChildProcessTree(child, force);
+	});
+}
+
+function attachAbortToChildProcess(child: ChildProcess, signal?: AbortSignal): () => void {
+	if (!signal) return () => {};
+	let escalationTimer: NodeJS.Timeout | undefined;
+
+	const onAbort = () => {
+		terminateChildProcessTree(child);
+		if (process.platform !== "win32") {
+			escalationTimer = setTimeout(() => terminateChildProcessTree(child, true), 1000);
+			escalationTimer.unref?.();
+		}
+	};
+	const cleanup = () => {
+		signal.removeEventListener("abort", onAbort);
+		child.off("close", cleanup);
+		if (escalationTimer) clearTimeout(escalationTimer);
+	};
+
+	signal.addEventListener("abort", onAbort, { once: true });
+	child.once("close", cleanup);
+	if (signal.aborted) onAbort();
+	return cleanup;
+}
 
 function stringEnum<T extends readonly string[]>(values: T, options?: { description?: string; default?: T[number] }): TUnsafe<T[number]> {
 	return Type.Unsafe({
@@ -202,7 +321,7 @@ const previewExportSchema = Type.Object({
 		description: "Base directory for resolving relative images/assets when source is markdown. Defaults to pi's current working directory.",
 	})),
 	outputPath: Type.Optional(Type.String({
-		description: "Optional destination path. Relative paths resolve against pi's current working directory. PNG exports with multiple pages append -1-of-N, -2-of-N, etc.",
+		description: "Optional destination path. Relative paths resolve against pi's current working directory. The expected extension is appended when omitted; mismatched extensions are rejected. PNG exports with multiple pages append -1-of-N, -2-of-N, etc.",
 	})),
 	open: Type.Optional(Type.Boolean({
 		description: "Open the generated artifact locally after writing it. Defaults to false for headless/remote sessions.",
@@ -874,7 +993,9 @@ async function resolvePreviewInput(
 		inputFormat?: PreviewInputFormat;
 		resourcePath?: string;
 	},
+	signal?: AbortSignal,
 ): Promise<ResolvedPreviewInput> {
+	throwIfPreviewAborted(signal);
 	const source = options.source ?? (options.markdown !== undefined ? "markdown" : options.path ? "file" : "last_assistant");
 
 	if (source === "file") {
@@ -882,7 +1003,8 @@ async function resolvePreviewInput(
 			throw new Error("preview_export source=file requires path.");
 		}
 		const filePath = resolveUserPath(ctx, options.path);
-		const fileContent = await readFile(filePath, "utf-8");
+		const fileContent = await readFile(filePath, { encoding: "utf-8", signal });
+		throwIfPreviewAborted(signal);
 		if (isLatexFile(filePath)) {
 			return {
 				markdown: fileContent,
@@ -1762,6 +1884,7 @@ function prepareBrowserPreviewMarkdown(markdown: string, isLatex?: boolean): {
 }
 
 async function renderPreview(markdown: string, style: PreviewStyle, signal?: AbortSignal, resourcePath?: string, skipCache?: boolean, isLatex?: boolean, fontSizePx?: number): Promise<RenderPreviewResult> {
+	throwIfPreviewAborted(signal);
 	const { normalizedMarkdown, pandocMarkdown, annotationPlaceholders } = prepareBrowserPreviewMarkdown(markdown, isLatex);
 	const previewFontSizePx = normalizePreviewFontSizePx(fontSizePx, DEFAULT_TERMINAL_PREVIEW_FONT_SIZE_PX);
 	const deviceScaleFactor = getTerminalDeviceScaleFactor();
@@ -1793,11 +1916,12 @@ async function renderPreview(markdown: string, style: PreviewStyle, signal?: Abo
 
 	await mkdir(CACHE_DIR, { recursive: true });
 
-	const fragmentHtml = await renderMarkdownToHtmlWithPandoc(pandocMarkdown, resourcePath, isLatex);
+	const fragmentHtml = await renderMarkdownToHtmlWithPandoc(pandocMarkdown, resourcePath, isLatex, "mathml", signal);
 	const html = buildBrowserHtmlFromPandocFragment(fragmentHtml, style, resourcePath, annotationPlaceholders, previewFontSizePx);
 
 	let browserPage: puppeteer.Page | undefined;
 	let tempHtmlPath: string | undefined;
+	let detachPageAbort = () => {};
 
 	try {
 		if (signal?.aborted) throw new Error("Preview rendering cancelled.");
@@ -1805,6 +1929,12 @@ async function renderPreview(markdown: string, style: PreviewStyle, signal?: Abo
 		const browser = await getSharedPreviewBrowser();
 		if (signal?.aborted) throw new Error("Preview rendering cancelled.");
 		browserPage = await browser.newPage();
+		const closePageOnAbort = () => {
+			void browserPage?.close().catch(() => {});
+		};
+		signal?.addEventListener("abort", closePageOnAbort, { once: true });
+		detachPageAbort = () => signal?.removeEventListener("abort", closePageOnAbort);
+		throwIfPreviewAborted(signal);
 
 		const loadHtml = async (height: number) => {
 			await browserPage!.setViewport({
@@ -1813,7 +1943,7 @@ async function renderPreview(markdown: string, style: PreviewStyle, signal?: Abo
 				deviceScaleFactor,
 			});
 			if (!tempHtmlPath) {
-				tempHtmlPath = join(CACHE_DIR, `_render_tmp_${Date.now()}.html`);
+				tempHtmlPath = join(CACHE_DIR, `_render_tmp_${randomUUID()}.html`);
 				await writeFile(tempHtmlPath, html, "utf-8");
 			}
 			await browserPage!.goto(pathToFileURL(tempHtmlPath).href, { waitUntil: "domcontentloaded" });
@@ -1904,8 +2034,13 @@ async function renderPreview(markdown: string, style: PreviewStyle, signal?: Abo
 			}
 		}
 
+		throwIfPreviewAborted(signal);
 		return { pages, themeMode: style.themeMode, truncatedPages };
+	} catch (error) {
+		if (isPreviewExportCancellation(error, signal)) throw new PreviewExportCancelledError();
+		throw error;
 	} finally {
+		detachPageAbort();
 		if (tempHtmlPath) await unlink(tempHtmlPath).catch(() => {});
 		if (browserPage) await browserPage.close().catch(() => {});
 	}
@@ -2245,7 +2380,8 @@ export async function openPreview(ctx: ExtensionCommandContext, markdownOverride
 	);
 }
 
-async function openFileInDefaultBrowser(filePath: string): Promise<void> {
+async function openFileInDefaultBrowser(filePath: string, signal?: AbortSignal): Promise<void> {
+	throwIfPreviewAborted(signal);
 	const target = pathToFileURL(filePath).href;
 	const openCommand =
 		process.platform === "darwin"
@@ -2259,11 +2395,30 @@ async function openFileInDefaultBrowser(filePath: string): Promise<void> {
 			stdio: "ignore",
 			detached: true,
 		});
-		child.once("error", reject);
+		let settled = false;
+		const cleanup = () => signal?.removeEventListener("abort", onAbort);
+		const onAbort = () => {
+			if (settled) return;
+			settled = true;
+			child.kill();
+			cleanup();
+			reject(new PreviewExportCancelledError());
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+		child.once("error", (error) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			reject(error);
+		});
 		child.once("spawn", () => {
+			if (settled) return;
+			settled = true;
+			cleanup();
 			child.unref();
 			resolve();
 		});
+		if (signal?.aborted) onAbort();
 	});
 }
 
@@ -2272,7 +2427,9 @@ async function renderMarkdownToHtmlWithPandoc(
 	resourcePath?: string,
 	isLatex?: boolean,
 	mathRenderer: PandocMathRenderer = "mathml",
+	signal?: AbortSignal,
 ): Promise<string> {
+	throwIfPreviewAborted(signal);
 	const pandocCommand = process.env.PANDOC_PATH?.trim() || "pandoc";
 	const pandocInput = isLatex ? markdown : normalizeMarkdownFencedBlocks(markdown);
 	const inputFormat = isLatex ? "latex" : "markdown+lists_without_preceding_blankline-blank_before_blockquote-blank_before_header+tex_math_dollars+autolink_bare_uris-raw_html";
@@ -2280,21 +2437,28 @@ async function renderMarkdownToHtmlWithPandoc(
 	if (resourcePath) args.push(`--resource-path=${resourcePath}`);
 
 	return await new Promise<string>((resolve, reject) => {
-		const child = spawn(pandocCommand, args, { stdio: ["pipe", "pipe", "pipe"] });
+		const child = crossSpawn(pandocCommand, args, {
+			stdio: ["pipe", "pipe", "pipe"],
+			detached: process.platform !== "win32",
+		}) as ChildProcessWithoutNullStreams;
 		const stdoutChunks: Buffer[] = [];
 		const stderrChunks: Buffer[] = [];
 		let settled = false;
+		let cleanupAbort = () => {};
 
 		const fail = (error: Error) => {
 			if (settled) return;
 			settled = true;
+			cleanupAbort();
 			reject(error);
 		};
 		const succeed = (html: string) => {
 			if (settled) return;
 			settled = true;
+			cleanupAbort();
 			resolve(html);
 		};
+		cleanupAbort = attachAbortToChildProcess(child, signal);
 
 		child.stdout.on("data", (chunk: Buffer | string) => {
 			stdoutChunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
@@ -2318,6 +2482,10 @@ async function renderMarkdownToHtmlWithPandoc(
 
 		child.once("close", (code) => {
 			if (settled) return;
+			if (signal?.aborted) {
+				fail(new PreviewExportCancelledError());
+				return;
+			}
 			if (code === 0) {
 				succeed(Buffer.concat(stdoutChunks).toString("utf-8"));
 				return;
@@ -2326,6 +2494,10 @@ async function renderMarkdownToHtmlWithPandoc(
 			fail(new Error(`pandoc failed with exit code ${code}${stderr ? `: ${stderr}` : ""}`));
 		});
 
+		child.stdin.on("error", (error: NodeJS.ErrnoException) => {
+			if (error.code === "EPIPE" || signal?.aborted) return;
+			fail(error);
+		});
 		child.stdin.end(pandocInput);
 	});
 }
@@ -2435,104 +2607,148 @@ async function ensurePdfPreamble(): Promise<string> {
 	return PDF_PREAMBLE_PATH;
 }
 
-async function compileLatexToPdf(latexSource: string, outputPath: string, resourcePath?: string): Promise<void> {
+async function compileLatexToPdf(latexSource: string, outputPath: string, resourcePath?: string, signal?: AbortSignal): Promise<void> {
+	throwIfPreviewAborted(signal);
 	const engine = process.env.PANDOC_PDF_ENGINE?.trim() || "xelatex";
-	const tmpDir = join(CACHE_DIR, `_latex_${Date.now()}`);
+	const tmpDir = join(CACHE_DIR, `_latex_${randomUUID()}`);
 	await mkdir(tmpDir, { recursive: true });
 
-	const texPath = join(tmpDir, "input.tex");
-	await writeFile(texPath, latexSource, "utf-8");
+	try {
+		const texPath = join(tmpDir, "input.tex");
+		await writeFile(texPath, latexSource, "utf-8");
+		throwIfPreviewAborted(signal);
 
-	// Symlink resource directory contents so \includegraphics can find figures
-	if (resourcePath) {
-		const { readdirSync } = await import("node:fs");
-		try {
-			for (const entry of readdirSync(resourcePath)) {
-				const src = join(resourcePath, entry);
-				const dest = join(tmpDir, entry);
-				try { await import("node:fs/promises").then(fs => fs.symlink(src, dest)); } catch { /* ignore collisions */ }
-			}
-		} catch { /* resource dir unreadable, skip */ }
-	}
+		// Symlink resource directory contents so \includegraphics can find figures.
+		if (resourcePath) {
+			const { readdirSync } = await import("node:fs");
+			try {
+				for (const entry of readdirSync(resourcePath)) {
+					const src = join(resourcePath, entry);
+					const dest = join(tmpDir, entry);
+					try { await import("node:fs/promises").then(fs => fs.symlink(src, dest)); } catch { /* ignore collisions */ }
+				}
+			} catch { /* resource dir unreadable, skip */ }
+		}
 
-	return await new Promise<void>((resolve, reject) => {
-		// Run twice for cross-references (\ref, \eqref, \label)
-		const runLatex = (pass: number) => {
-			const child = spawn(engine, [
-				"-interaction=nonstopmode",
-				"-halt-on-error",
-				"-output-directory", tmpDir,
-				texPath,
-			], { stdio: ["pipe", "pipe", "pipe"], cwd: tmpDir });
-
-			const stderrChunks: Buffer[] = [];
-			const stdoutChunks: Buffer[] = [];
-			let passSettled = false;
-			const timeoutMs = getPdfRenderTimeoutMs();
-			const timeout = setTimeout(() => {
-				if (passSettled) return;
-				passSettled = true;
-				child.kill("SIGTERM");
-				reject(new Error(`${engine} timed out after ${formatTimeoutMs(timeoutMs)} on pass ${pass}.`));
-			}, timeoutMs);
-			timeout.unref?.();
-
-			child.stdout.on("data", (chunk: Buffer | string) => {
-				stdoutChunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
-			});
-			child.stderr.on("data", (chunk: Buffer | string) => {
-				stderrChunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
-			});
-
-			child.once("error", (error) => {
-				if (passSettled) return;
-				passSettled = true;
-				clearTimeout(timeout);
-				const errno = error as NodeJS.ErrnoException;
-				if (errno.code === "ENOENT") {
-					reject(new Error(
-						`${engine} was not found. Install TeX Live (brew install --cask mactex) or set PANDOC_PDF_ENGINE.`,
-					));
+		await new Promise<void>((resolve, reject) => {
+			// Run twice for cross-references (\ref, \eqref, \label).
+			const runLatex = (pass: number) => {
+				if (signal?.aborted) {
+					reject(new PreviewExportCancelledError());
 					return;
 				}
-				reject(error);
-			});
 
-			child.once("close", (code) => {
-				if (passSettled) return;
-				passSettled = true;
-				clearTimeout(timeout);
-				if (code !== 0 && pass === 2) {
-					const log = `${Buffer.concat(stdoutChunks).toString("utf-8")}\n${Buffer.concat(stderrChunks).toString("utf-8")}`;
-					// Extract the first LaTeX error line for a useful message
-					const errorMatch = log.match(/^! .+$/m);
-					const hint = errorMatch ? errorMatch[0] : log.trim().slice(-2000);
-					reject(new Error(`${engine} failed (exit ${code})${hint ? `: ${hint}` : ""}`));
-					return;
-				}
-				if (pass === 1) {
-					runLatex(2);
-				} else {
-					// Copy PDF to output path
+				const child = crossSpawn(engine, [
+					"-interaction=nonstopmode",
+					"-halt-on-error",
+					"-output-directory", tmpDir,
+					texPath,
+				], {
+					stdio: ["pipe", "pipe", "pipe"],
+					cwd: tmpDir,
+					detached: process.platform !== "win32",
+				}) as ChildProcessWithoutNullStreams;
+
+				const stderrChunks: Buffer[] = [];
+				const stdoutChunks: Buffer[] = [];
+				let passSettled = false;
+				let timeoutError: Error | undefined;
+				let cleanupAbort = attachAbortToChildProcess(child, signal);
+				const timeoutMs = getPdfRenderTimeoutMs();
+				const timeout = setTimeout(() => {
+					if (passSettled) return;
+					timeoutError = new Error(`${engine} timed out after ${formatTimeoutMs(timeoutMs)} on pass ${pass}.`);
+					void terminateChildProcessTreeAndWait(child, true).then(() => {
+						if (!settle()) return;
+						reject(timeoutError);
+					});
+				}, timeoutMs);
+				timeout.unref?.();
+
+				const settle = () => {
+					if (passSettled) return false;
+					passSettled = true;
+					clearTimeout(timeout);
+					cleanupAbort();
+					cleanupAbort = () => {};
+					return true;
+				};
+
+				child.stdout.on("data", (chunk: Buffer | string) => {
+					stdoutChunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+				});
+				child.stderr.on("data", (chunk: Buffer | string) => {
+					stderrChunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+				});
+
+				child.once("error", (error) => {
+					if (!settle()) return;
+					if (timeoutError) {
+						reject(timeoutError);
+						return;
+					}
+					if (signal?.aborted) {
+						reject(new PreviewExportCancelledError());
+						return;
+					}
+					const errno = error as NodeJS.ErrnoException;
+					if (errno.code === "ENOENT") {
+						reject(new Error(
+							`${engine} was not found. Install TeX Live (brew install --cask mactex) or set PANDOC_PDF_ENGINE.`,
+						));
+						return;
+					}
+					reject(error);
+				});
+
+				child.once("close", (code) => {
+					if (!settle()) return;
+					if (timeoutError) {
+						reject(timeoutError);
+						return;
+					}
+					if (signal?.aborted) {
+						reject(new PreviewExportCancelledError());
+						return;
+					}
+					if (code !== 0 && pass === 2) {
+						const log = `${Buffer.concat(stdoutChunks).toString("utf-8")}\n${Buffer.concat(stderrChunks).toString("utf-8")}`;
+						const errorMatch = log.match(/^! .+$/m);
+						const hint = errorMatch ? errorMatch[0] : log.trim().slice(-2000);
+						reject(new Error(`${engine} failed (exit ${code})${hint ? `: ${hint}` : ""}`));
+						return;
+					}
+					if (pass === 1) {
+						runLatex(2);
+						return;
+					}
+
 					const generatedPdf = join(tmpDir, "input.pdf");
-					import("node:fs/promises").then(fs =>
-						fs.copyFile(generatedPdf, outputPath).then(() => resolve())
-					).catch(reject);
-				}
-			});
+					copyFile(generatedPdf, outputPath).then(resolve).catch(reject);
+				});
 
-			child.stdin.end();
-		};
+				child.stdin.on("error", (error: NodeJS.ErrnoException) => {
+					if (error.code === "EPIPE" || signal?.aborted || passSettled) return;
+					if (!settle()) return;
+					reject(error);
+				});
+				child.stdin.end();
+			};
 
-		runLatex(1);
-	});
+			runLatex(1);
+		});
+	} finally {
+		await rm(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }).catch(() => {});
+	}
 }
 
-async function renderMarkdownToPdf(markdown: string, outputPath: string, resourcePath?: string): Promise<void> {
+async function renderMarkdownToPdf(markdown: string, outputPath: string, resourcePath?: string, signal?: AbortSignal): Promise<void> {
+	throwIfPreviewAborted(signal);
 	const pandocCommand = process.env.PANDOC_PATH?.trim() || "pandoc";
 	const pandocInput = normalizeMarkdownFencedBlocks(markdown);
 	const pdfEngine = process.env.PANDOC_PDF_ENGINE?.trim() || "xelatex";
 	const preamblePath = await ensurePdfPreamble();
+	throwIfPreviewAborted(signal);
 	const args = [
 		"-f", "markdown+lists_without_preceding_blankline-blank_before_blockquote-blank_before_header+tex_math_dollars+autolink_bare_uris+superscript+subscript-raw_html",
 		"-o", outputPath,
@@ -2548,14 +2764,19 @@ async function renderMarkdownToPdf(markdown: string, outputPath: string, resourc
 	if (resourcePath) args.push(`--resource-path=${resourcePath}`);
 
 	return await new Promise<void>((resolve, reject) => {
-		const child = spawn(pandocCommand, args, { stdio: ["pipe", "pipe", "pipe"] });
+		const child = crossSpawn(pandocCommand, args, {
+			stdio: ["pipe", "pipe", "pipe"],
+			detached: process.platform !== "win32",
+		}) as ChildProcessWithoutNullStreams;
 		const stdoutChunks: Buffer[] = [];
 		const stderrChunks: Buffer[] = [];
 		let settled = false;
+		let timeoutError: Error | undefined;
+		let cleanupAbort = attachAbortToChildProcess(child, signal);
 		const timeoutMs = getPdfRenderTimeoutMs();
 		const timeout = setTimeout(() => {
-			child.kill("SIGTERM");
-			fail(new Error(`pandoc PDF export timed out after ${formatTimeoutMs(timeoutMs)}.`));
+			timeoutError = new Error(`pandoc PDF export timed out after ${formatTimeoutMs(timeoutMs)}.`);
+			void terminateChildProcessTreeAndWait(child, true).then(() => fail(timeoutError!));
 		}, timeoutMs);
 		timeout.unref?.();
 
@@ -2563,7 +2784,17 @@ async function renderMarkdownToPdf(markdown: string, outputPath: string, resourc
 			if (settled) return;
 			settled = true;
 			clearTimeout(timeout);
+			cleanupAbort();
+			cleanupAbort = () => {};
 			reject(error);
+		};
+		const succeed = () => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timeout);
+			cleanupAbort();
+			cleanupAbort = () => {};
+			resolve();
 		};
 
 		child.stdout.on("data", (chunk: Buffer | string) => {
@@ -2574,6 +2805,10 @@ async function renderMarkdownToPdf(markdown: string, outputPath: string, resourc
 		});
 
 		child.once("error", (error) => {
+			if (signal?.aborted) {
+				fail(new PreviewExportCancelledError());
+				return;
+			}
 			const errno = error as NodeJS.ErrnoException;
 			if (errno.code === "ENOENT") {
 				fail(
@@ -2588,10 +2823,16 @@ async function renderMarkdownToPdf(markdown: string, outputPath: string, resourc
 
 		child.once("close", (code) => {
 			if (settled) return;
-			clearTimeout(timeout);
+			if (timeoutError) {
+				fail(timeoutError);
+				return;
+			}
+			if (signal?.aborted) {
+				fail(new PreviewExportCancelledError());
+				return;
+			}
 			if (code === 0) {
-				settled = true;
-				resolve();
+				succeed();
 				return;
 			}
 			const stderr = Buffer.concat(stderrChunks).toString("utf-8").trim();
@@ -2603,6 +2844,10 @@ async function renderMarkdownToPdf(markdown: string, outputPath: string, resourc
 			fail(new Error(`pandoc PDF export failed with exit code ${code}${details ? `: ${details}` : ""}${hint}`));
 		});
 
+		child.stdin.on("error", (error: NodeJS.ErrnoException) => {
+			if (error.code === "EPIPE" || signal?.aborted) return;
+			fail(error);
+		});
 		child.stdin.end(pandocInput);
 	});
 }
@@ -2785,10 +3030,12 @@ function rewriteGeneratedDiffHighlighting(latex: string): string {
 	return out.join("\n");
 }
 
-async function renderMarkdownToPdfViaGeneratedLatex(markdown: string, outputPath: string, resourcePath?: string): Promise<void> {
+async function renderMarkdownToPdfViaGeneratedLatex(markdown: string, outputPath: string, resourcePath?: string, signal?: AbortSignal): Promise<void> {
+	throwIfPreviewAborted(signal);
 	const pandocCommand = process.env.PANDOC_PATH?.trim() || "pandoc";
 	const pandocInput = normalizeMarkdownFencedBlocks(markdown);
 	const preamblePath = await ensurePdfPreamble();
+	throwIfPreviewAborted(signal);
 	const args = [
 		"-f", "markdown+lists_without_preceding_blankline-blank_before_blockquote-blank_before_header+tex_math_dollars+autolink_bare_uris+superscript+subscript-raw_html",
 		"-t", "latex",
@@ -2803,14 +3050,19 @@ async function renderMarkdownToPdfViaGeneratedLatex(markdown: string, outputPath
 	if (resourcePath) args.push(`--resource-path=${resourcePath}`);
 
 	const generatedLatex = await new Promise<string>((resolve, reject) => {
-		const child = spawn(pandocCommand, args, { stdio: ["pipe", "pipe", "pipe"] });
+		const child = crossSpawn(pandocCommand, args, {
+			stdio: ["pipe", "pipe", "pipe"],
+			detached: process.platform !== "win32",
+		}) as ChildProcessWithoutNullStreams;
 		const stdoutChunks: Buffer[] = [];
 		const stderrChunks: Buffer[] = [];
 		let settled = false;
+		let timeoutError: Error | undefined;
+		let cleanupAbort = attachAbortToChildProcess(child, signal);
 		const timeoutMs = getPdfRenderTimeoutMs();
 		const timeout = setTimeout(() => {
-			child.kill("SIGTERM");
-			fail(new Error(`pandoc LaTeX generation timed out after ${formatTimeoutMs(timeoutMs)}.`));
+			timeoutError = new Error(`pandoc LaTeX generation timed out after ${formatTimeoutMs(timeoutMs)}.`);
+			void terminateChildProcessTreeAndWait(child, true).then(() => fail(timeoutError!));
 		}, timeoutMs);
 		timeout.unref?.();
 
@@ -2818,7 +3070,17 @@ async function renderMarkdownToPdfViaGeneratedLatex(markdown: string, outputPath
 			if (settled) return;
 			settled = true;
 			clearTimeout(timeout);
+			cleanupAbort();
+			cleanupAbort = () => {};
 			reject(error);
+		};
+		const succeed = (latex: string) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timeout);
+			cleanupAbort();
+			cleanupAbort = () => {};
+			resolve(latex);
 		};
 
 		child.stdout.on("data", (chunk: Buffer | string) => {
@@ -2829,6 +3091,10 @@ async function renderMarkdownToPdfViaGeneratedLatex(markdown: string, outputPath
 		});
 
 		child.once("error", (error) => {
+			if (signal?.aborted) {
+				fail(new PreviewExportCancelledError());
+				return;
+			}
 			const errno = error as NodeJS.ErrnoException;
 			if (errno.code === "ENOENT") {
 				fail(
@@ -2843,20 +3109,31 @@ async function renderMarkdownToPdfViaGeneratedLatex(markdown: string, outputPath
 
 		child.once("close", (code) => {
 			if (settled) return;
+			if (timeoutError) {
+				fail(timeoutError);
+				return;
+			}
+			if (signal?.aborted) {
+				fail(new PreviewExportCancelledError());
+				return;
+			}
 			if (code === 0) {
-				settled = true;
-				clearTimeout(timeout);
-				resolve(Buffer.concat(stdoutChunks).toString("utf-8"));
+				succeed(Buffer.concat(stdoutChunks).toString("utf-8"));
 				return;
 			}
 			const stderr = Buffer.concat(stderrChunks).toString("utf-8").trim();
 			fail(new Error(`pandoc LaTeX generation failed with exit code ${code}${stderr ? `: ${stderr}` : ""}`));
 		});
 
+		child.stdin.on("error", (error: NodeJS.ErrnoException) => {
+			if (error.code === "EPIPE" || signal?.aborted) return;
+			fail(error);
+		});
 		child.stdin.end(pandocInput);
 	});
 
-	await compileLatexToPdf(rewriteGeneratedDiffHighlighting(generatedLatex), outputPath, resourcePath);
+	throwIfPreviewAborted(signal);
+	await compileLatexToPdf(rewriteGeneratedDiffHighlighting(generatedLatex), outputPath, resourcePath, signal);
 }
 
 class MermaidCliMissingError extends Error {}
@@ -2877,25 +3154,33 @@ function getMermaidPdfTheme(): "default" | "forest" | "dark" | "neutral" {
 	return "default";
 }
 
-async function renderMermaidDiagramForPdf(source: string, outputPath: string): Promise<void> {
+async function renderMermaidDiagramForPdf(source: string, outputPath: string, signal?: AbortSignal): Promise<void> {
+	throwIfPreviewAborted(signal);
 	const mermaidCommand = process.env.MERMAID_CLI_PATH?.trim() || "mmdc";
 	const mermaidTheme = getMermaidPdfTheme();
 	const tempDir = await mkdtemp(join(tmpdir(), "pi-markdown-preview-mermaid-"));
 	const inputPath = join(tempDir, "diagram.mmd");
+	const temporaryOutputPath = join(dirname(outputPath), `.${basename(outputPath)}.${randomUUID()}.tmp.pdf`);
 
 	await mkdir(dirname(outputPath), { recursive: true });
 
 	try {
 		await writeFile(inputPath, source, "utf-8");
+		throwIfPreviewAborted(signal);
 		await new Promise<void>((resolve, reject) => {
-			const args = ["-i", inputPath, "-o", outputPath, "-t", mermaidTheme, "-f"];
-			const child = spawn(mermaidCommand, args, { stdio: ["ignore", "ignore", "pipe"] });
+			const args = ["-i", inputPath, "-o", temporaryOutputPath, "-t", mermaidTheme, "-f"];
+			const child = crossSpawn(mermaidCommand, args, {
+				stdio: ["ignore", "ignore", "pipe"],
+				detached: process.platform !== "win32",
+			});
 			const stderrChunks: Buffer[] = [];
 			let settled = false;
+			let timeoutError: Error | undefined;
+			let cleanupAbort = attachAbortToChildProcess(child, signal);
 			const timeoutMs = getPdfRenderTimeoutMs();
 			const timeout = setTimeout(() => {
-				child.kill("SIGTERM");
-				fail(new Error(`Mermaid CLI timed out after ${formatTimeoutMs(timeoutMs)}.`));
+				timeoutError = new Error(`Mermaid CLI timed out after ${formatTimeoutMs(timeoutMs)}.`);
+				void terminateChildProcessTreeAndWait(child, true).then(() => fail(timeoutError!));
 			}, timeoutMs);
 			timeout.unref?.();
 
@@ -2903,14 +3188,28 @@ async function renderMermaidDiagramForPdf(source: string, outputPath: string): P
 				if (settled) return;
 				settled = true;
 				clearTimeout(timeout);
+				cleanupAbort();
+				cleanupAbort = () => {};
 				reject(error);
 			};
+			const succeed = () => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timeout);
+				cleanupAbort();
+				cleanupAbort = () => {};
+				resolve();
+			};
 
-			child.stderr.on("data", (chunk: Buffer | string) => {
+			child.stderr!.on("data", (chunk: Buffer | string) => {
 				stderrChunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
 			});
 
 			child.once("error", (error) => {
+				if (signal?.aborted) {
+					fail(new PreviewExportCancelledError());
+					return;
+				}
 				const errno = error as NodeJS.ErrnoException;
 				if (errno.code === "ENOENT") {
 					fail(
@@ -2925,22 +3224,32 @@ async function renderMermaidDiagramForPdf(source: string, outputPath: string): P
 
 			child.once("close", (code) => {
 				if (settled) return;
-				settled = true;
-				clearTimeout(timeout);
+				if (timeoutError) {
+					fail(timeoutError);
+					return;
+				}
+				if (signal?.aborted) {
+					fail(new PreviewExportCancelledError());
+					return;
+				}
 				if (code === 0) {
-					resolve();
+					succeed();
 					return;
 				}
 				const stderr = Buffer.concat(stderrChunks).toString("utf-8").trim();
-				reject(new Error(`Mermaid CLI failed with exit code ${code}${stderr ? `: ${stderr}` : ""}`));
+				fail(new Error(`Mermaid CLI failed with exit code ${code}${stderr ? `: ${stderr}` : ""}`));
 			});
 		});
+		throwIfPreviewAborted(signal);
+		await rename(temporaryOutputPath, outputPath);
 	} finally {
-		await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+		await unlink(temporaryOutputPath).catch(() => {});
+		await rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }).catch(() => {});
 	}
 }
 
-async function preprocessMermaidForPdf(markdown: string): Promise<MermaidPdfPreprocessResult> {
+async function preprocessMermaidForPdf(markdown: string, signal?: AbortSignal): Promise<MermaidPdfPreprocessResult> {
+	throwIfPreviewAborted(signal);
 	const mermaidRegex = /```mermaid[^\n]*\n([\s\S]*?)```/gi;
 	const matches: Array<{ start: number; end: number; raw: string; source: string; number: number }> = [];
 	let match: RegExpExecArray | null;
@@ -2975,6 +3284,7 @@ async function preprocessMermaidForPdf(markdown: string): Promise<MermaidPdfPrep
 	const mermaidTheme = getMermaidPdfTheme();
 
 	for (const block of matches) {
+		throwIfPreviewAborted(signal);
 		if (renderedBySource.has(block.source)) continue;
 
 		const hash = createHash("sha256")
@@ -2999,9 +3309,10 @@ async function preprocessMermaidForPdf(markdown: string): Promise<MermaidPdfPrep
 		}
 
 		try {
-			await renderMermaidDiagramForPdf(block.source, outputPath);
+			await renderMermaidDiagramForPdf(block.source, outputPath, signal);
 			renderedBySource.set(block.source, outputPath);
 		} catch (error) {
+			if (isPreviewExportCancellation(error, signal)) throw new PreviewExportCancelledError();
 			if (error instanceof MermaidCliMissingError) {
 				missingCli = true;
 			}
@@ -3045,11 +3356,14 @@ async function renderPreviewPdfToFile(
 	resourcePath?: string,
 	isLatex?: boolean,
 	onWarning?: (message: string) => void,
+	signal?: AbortSignal,
 ): Promise<string> {
+	throwIfPreviewAborted(signal);
 	const normalizedMarkdown = isLatex
 		? markdown
 		: normalizeSubSupTags(normalizeMarkdownFencedBlocks(normalizeObsidianImages(normalizeMathDelimiters(markdown))));
-	const mermaidPrepared = isLatex ? { markdown: normalizedMarkdown, found: 0, replaced: 0, failed: 0, missingCli: false } : await preprocessMermaidForPdf(normalizedMarkdown);
+	const mermaidPrepared = isLatex ? { markdown: normalizedMarkdown, found: 0, replaced: 0, failed: 0, missingCli: false } : await preprocessMermaidForPdf(normalizedMarkdown, signal);
+	throwIfPreviewAborted(signal);
 
 	if (mermaidPrepared.missingCli) {
 		onWarning?.("Mermaid CLI (mmdc) not found; Mermaid blocks are kept as code in PDF. Install @mermaid-js/mermaid-cli or set MERMAID_CLI_PATH.");
@@ -3068,16 +3382,23 @@ async function renderPreviewPdfToFile(
 		.update(markdownForPdf)
 		.digest("hex");
 	const pdfPath = outputPath ?? join(CACHE_DIR, `${hash}.pdf`);
+	const temporaryPath = join(dirname(pdfPath), `.${basename(pdfPath)}.${randomUUID()}.tmp.pdf`);
 
 	await mkdir(dirname(pdfPath), { recursive: true });
-	if (isLatex) {
-		await compileLatexToPdf(markdownForPdf, pdfPath, resourcePath);
-	} else if (hasMarkdownDiffFence(markdownForPdf)) {
-		await renderMarkdownToPdfViaGeneratedLatex(markdownForPdf, pdfPath, resourcePath);
-	} else {
-		await renderMarkdownToPdf(markdownForPdf, pdfPath, resourcePath);
+	try {
+		if (isLatex) {
+			await compileLatexToPdf(markdownForPdf, temporaryPath, resourcePath, signal);
+		} else if (hasMarkdownDiffFence(markdownForPdf)) {
+			await renderMarkdownToPdfViaGeneratedLatex(markdownForPdf, temporaryPath, resourcePath, signal);
+		} else {
+			await renderMarkdownToPdf(markdownForPdf, temporaryPath, resourcePath, signal);
+		}
+		throwIfPreviewAborted(signal);
+		await rename(temporaryPath, pdfPath);
+		return pdfPath;
+	} finally {
+		await unlink(temporaryPath).catch(() => {});
 	}
-	return pdfPath;
 }
 
 async function exportPdf(ctx: ExtensionCommandContext, markdownOverride?: string, resourcePath?: string, isLatex?: boolean): Promise<void> {
@@ -3848,10 +4169,12 @@ async function renderPreviewHtmlToFile(
 	fontSizePx?: number,
 	outputPath?: string,
 	mathJaxAssetMode: MathJaxAssetMode = "local-chtml",
+	signal?: AbortSignal,
 ): Promise<string> {
+	throwIfPreviewAborted(signal);
 	const previewFontSizePx = normalizePreviewFontSizePx(fontSizePx, DEFAULT_BROWSER_PREVIEW_FONT_SIZE_PX);
 	const { normalizedMarkdown, pandocMarkdown, annotationPlaceholders } = prepareBrowserPreviewMarkdown(markdown, isLatex);
-	const fragmentHtml = await renderMarkdownToHtmlWithPandoc(pandocMarkdown, resourcePath, isLatex, "mathjax");
+	const fragmentHtml = await renderMarkdownToHtmlWithPandoc(pandocMarkdown, resourcePath, isLatex, "mathjax", signal);
 	const html = buildBrowserHtmlFromPandocFragment(fragmentHtml, style, resourcePath, annotationPlaceholders, previewFontSizePx, mathJaxAssetMode);
 	const hash = createHash("sha256")
 		.update(RENDER_VERSION)
@@ -3869,10 +4192,17 @@ async function renderPreviewHtmlToFile(
 		.update(normalizedMarkdown)
 		.digest("hex");
 	const htmlPath = outputPath ?? join(CACHE_DIR, `${hash}.html`);
+	const temporaryPath = join(dirname(htmlPath), `.${basename(htmlPath)}.${randomUUID()}.tmp.html`);
 
 	await mkdir(dirname(htmlPath), { recursive: true });
-	await writeFile(htmlPath, html, "utf-8");
-	return htmlPath;
+	try {
+		await writeFile(temporaryPath, html, "utf-8");
+		throwIfPreviewAborted(signal);
+		await rename(temporaryPath, htmlPath);
+		return htmlPath;
+	} finally {
+		await unlink(temporaryPath).catch(() => {});
+	}
 }
 
 export async function openPreviewInBrowser(
@@ -3905,7 +4235,7 @@ function getDefaultBrowserPdfOutputPath(
 	out?: string,
 	outDir?: string,
 ): string {
-	if (out) return resolveUserPath(ctx, out);
+	if (out) return normalizeArtifactOutputPath(resolveUserPath(ctx, out), "pdf");
 
 	const directory = outDir ? resolveUserPath(ctx, outDir) : resolvePath(ctx.cwd, ".pi-markdown-preview");
 	const sourceName = sourceFilePath ? basename(sourceFilePath, extname(sourceFilePath)) : "preview";
@@ -3946,11 +4276,85 @@ async function renderBrowserPdfToFile(
 	}
 }
 
+function normalizeArtifactOutputPath(outputPath: string, format: PreviewExportFormat): string {
+	const expectedExtension = `.${format}`;
+	const extension = extname(outputPath);
+	if (!extension) return `${outputPath}${expectedExtension}`;
+	if (extension.toLowerCase() !== expectedExtension) {
+		throw new Error(`Output path for ${format.toUpperCase()} must use the ${expectedExtension} extension, received "${extension}".`);
+	}
+	return outputPath;
+}
+
+const artifactPublicationTails = new Map<string, Promise<void>>();
+
+async function withArtifactPublicationLocks<T>(destinationPaths: string[], publish: () => Promise<T>): Promise<T> {
+	const locks: Array<{ path: string; tail: Promise<void>; release: () => void }> = [];
+	const normalizedPaths = [...new Set(destinationPaths.map((destinationPath) => resolvePath(destinationPath)))].sort();
+
+	for (const path of normalizedPaths) {
+		const previous = artifactPublicationTails.get(path) ?? Promise.resolve();
+		let release!: () => void;
+		const gate = new Promise<void>((resolveGate) => { release = resolveGate; });
+		const tail = previous.catch(() => {}).then(() => gate);
+		artifactPublicationTails.set(path, tail);
+		await previous.catch(() => {});
+		locks.push({ path, tail, release });
+	}
+
+	try {
+		return await publish();
+	} finally {
+		for (const lock of locks.reverse()) {
+			lock.release();
+			if (artifactPublicationTails.get(lock.path) === lock.tail) artifactPublicationTails.delete(lock.path);
+		}
+	}
+}
+
+async function publishStagedFiles(temporaryPaths: string[], destinationPaths: string[]): Promise<void> {
+	if (temporaryPaths.length !== destinationPaths.length) {
+		throw new Error("Staged artifact and destination counts do not match.");
+	}
+
+	await withArtifactPublicationLocks(destinationPaths, async () => {
+		const backups = new Map<string, string>();
+		const published: string[] = [];
+		try {
+			for (const destinationPath of destinationPaths) {
+				if (!existsSync(destinationPath)) continue;
+				const backupPath = join(dirname(destinationPath), `.${basename(destinationPath)}.${randomUUID()}.backup`);
+				await rename(destinationPath, backupPath);
+				backups.set(destinationPath, backupPath);
+			}
+			for (let index = 0; index < temporaryPaths.length; index++) {
+				const destinationPath = destinationPaths[index]!;
+				await rename(temporaryPaths[index]!, destinationPath);
+				published.push(destinationPath);
+			}
+		} catch (error) {
+			const rollbackErrors: unknown[] = [];
+			for (const destinationPath of published.reverse()) {
+				await unlink(destinationPath).catch((rollbackError) => rollbackErrors.push(rollbackError));
+			}
+			for (const [destinationPath, backupPath] of [...backups.entries()].reverse()) {
+				await rename(backupPath, destinationPath).catch((rollbackError) => rollbackErrors.push(rollbackError));
+			}
+			if (rollbackErrors.length > 0) {
+				throw new AggregateError([error, ...rollbackErrors], "Artifact publication failed and rollback was incomplete.");
+			}
+			throw error;
+		}
+
+		await Promise.all([...backups.values()].map((backupPath) => unlink(backupPath).catch(() => {})));
+	});
+}
+
 function buildPagedPngOutputPaths(basePath: string, pageCount: number): string[] {
-	if (pageCount <= 1) return [basePath];
-	const extension = extname(basePath) || ".png";
-	const stem = extname(basePath) ? basePath.slice(0, -extension.length) : basePath;
-	return Array.from({ length: pageCount }, (_value, index) => `${stem}-${index + 1}-of-${pageCount}${extension}`);
+	const normalizedBasePath = normalizeArtifactOutputPath(basePath, "png");
+	if (pageCount <= 1) return [normalizedBasePath];
+	const stem = normalizedBasePath.slice(0, -extname(normalizedBasePath).length);
+	return Array.from({ length: pageCount }, (_value, index) => `${stem}-${index + 1}-of-${pageCount}.png`);
 }
 
 async function renderPreviewPngFiles(
@@ -3962,6 +4366,7 @@ async function renderPreviewPngFiles(
 	fontSizePx?: number,
 	signal?: AbortSignal,
 ): Promise<{ paths: string[]; pageCount: number; truncatedPages: boolean; themeMode: ThemeMode }> {
+	throwIfPreviewAborted(signal);
 	const previewFontSizePx = normalizePreviewFontSizePx(fontSizePx, DEFAULT_TERMINAL_PREVIEW_FONT_SIZE_PX);
 	const preview = await renderPreview(markdown, style, signal, resourcePath, undefined, isLatex, previewFontSizePx);
 	const artifactKey = buildRenderCacheKey(`${style.cacheKey}|artifact=png|fontSize=${previewFontSizePx}|scale=${getTerminalDeviceScaleFactor()}`, resourcePath, isLatex);
@@ -3976,51 +4381,90 @@ async function renderPreviewPngFiles(
 		.digest("hex");
 	const basePath = outputPath ?? join(CACHE_DIR, `${hash}.png`);
 	const paths = buildPagedPngOutputPaths(basePath, preview.pages.length);
+	const temporaryPaths = paths.map((filePath) => join(dirname(filePath), `.${basename(filePath)}.${randomUUID()}.tmp.png`));
 
-	await Promise.all(paths.map((filePath, index) => (async () => {
-		await mkdir(dirname(filePath), { recursive: true });
-		await writeFile(filePath, Buffer.from(preview.pages[index]!.base64Png, "base64"));
-	})()));
+	try {
+		await Promise.all(temporaryPaths.map(async (temporaryPath, index) => {
+			await mkdir(dirname(temporaryPath), { recursive: true });
+			await writeFile(temporaryPath, Buffer.from(preview.pages[index]!.base64Png, "base64"));
+		}));
+		throwIfPreviewAborted(signal);
+		await publishStagedFiles(temporaryPaths, paths);
 
-	return {
-		paths,
-		pageCount: preview.pages.length,
-		truncatedPages: preview.truncatedPages || preview.pages.some((page) => page.truncatedHeight),
-		themeMode: preview.themeMode,
-	};
+		return {
+			paths,
+			pageCount: preview.pages.length,
+			truncatedPages: preview.truncatedPages || preview.pages.some((page) => page.truncatedHeight),
+			themeMode: preview.themeMode,
+		};
+	} finally {
+		await Promise.all(temporaryPaths.map((temporaryPath) => unlink(temporaryPath).catch(() => {})));
+	}
 }
 
-function tokenizeArgs(input: string): string[] {
+function tokenizeArgs(input: string): { tokens?: string[]; error?: string } {
 	const tokens: string[] = [];
-	const s = input.trim();
-	let i = 0;
+	let token = "";
+	let tokenStarted = false;
+	let quote: '"' | "'" | undefined;
 
-	while (i < s.length) {
-		while (i < s.length && /\s/.test(s[i]!)) i++;
-		if (i >= s.length) break;
+	for (let index = 0; index < input.length; index++) {
+		const character = input[index]!;
 
-		const ch = s[i]!;
-		if (ch === '"' || ch === "'") {
-			const quote = ch;
-			i++;
-			let token = "";
-			while (i < s.length && s[i] !== quote) {
-				token += s[i];
-				i++;
+		if (quote) {
+			if (character === quote) {
+				quote = undefined;
+				tokenStarted = true;
+				continue;
 			}
-			if (i < s.length) i++; // skip closing quote
-			tokens.push(token);
-		} else {
-			let token = "";
-			while (i < s.length && !/\s/.test(s[i]!)) {
-				token += s[i];
-				i++;
+			if (character === "\\" && quote === '"') {
+				const next = input[index + 1];
+				if (next === '"' || next === "\\") {
+					token += next;
+					index++;
+				} else {
+					token += character;
+				}
+				tokenStarted = true;
+				continue;
 			}
-			tokens.push(token);
+			token += character;
+			tokenStarted = true;
+			continue;
 		}
+
+		if (/\s/.test(character)) {
+			if (tokenStarted) {
+				tokens.push(token);
+				token = "";
+				tokenStarted = false;
+			}
+			continue;
+		}
+		if (character === '"' || character === "'") {
+			quote = character;
+			tokenStarted = true;
+			continue;
+		}
+		if (character === "\\") {
+			const next = input[index + 1];
+			if (next && (/\s/.test(next) || next === '"' || next === "'" || next === "\\")) {
+				token += next;
+				index++;
+			} else {
+				token += character;
+			}
+			tokenStarted = true;
+			continue;
+		}
+
+		token += character;
+		tokenStarted = true;
 	}
 
-	return tokens;
+	if (quote) return { error: `Unterminated ${quote === '"' ? "double" : "single"} quote.` };
+	if (tokenStarted) tokens.push(token);
+	return { tokens };
 }
 
 function parsePreviewFontSize(raw: string): { value?: number; error?: string } {
@@ -4036,7 +4480,9 @@ function parsePreviewFontSize(raw: string): { value?: number; error?: string } {
 }
 
 function parsePreviewArgs(args: string, options: ParsePreviewArgsOptions = {}): ParsedPreviewArgs {
-	const tokens = tokenizeArgs(args);
+	const tokenized = tokenizeArgs(args);
+	if (tokenized.error || !tokenized.tokens) return { error: tokenized.error ?? "Failed to parse preview arguments." };
+	const tokens = tokenized.tokens;
 	let target: PreviewTarget = "terminal";
 	let explicitTarget = false;
 	let pick = false;
@@ -4045,9 +4491,20 @@ function parsePreviewArgs(args: string, options: ParsePreviewArgsOptions = {}): 
 	let theme: BrowserThemePreference | undefined;
 	let out: string | undefined;
 	let outDir: string | undefined;
+	let optionsEnded = false;
 
 	for (let i = 0; i < tokens.length; i++) {
 		const token = tokens[i]!;
+
+		if (optionsEnded) {
+			if (file) return { error: `Unexpected extra file path "${token}".` };
+			file = token;
+			continue;
+		}
+		if (token === "--") {
+			optionsEnded = true;
+			continue;
+		}
 
 		if (token === "--help" || token === "-h" || token === "help") {
 			return { help: true };
@@ -4058,9 +4515,15 @@ function parsePreviewArgs(args: string, options: ParsePreviewArgsOptions = {}): 
 			continue;
 		}
 
+		const fileEquals = token.match(/^--file=(.*)$/) ?? token.match(/^-f=(.*)$/);
+		if (fileEquals) {
+			if (!fileEquals[1]) return { error: "Missing file path after --file." };
+			file = fileEquals[1];
+			continue;
+		}
 		if (token === "--file" || token === "-f") {
 			const next = tokens[i + 1];
-			if (!next || next.startsWith("-")) {
+			if (next === undefined) {
 				return { error: "Missing file path after --file." };
 			}
 			file = next;
@@ -4088,17 +4551,32 @@ function parsePreviewArgs(args: string, options: ParsePreviewArgsOptions = {}): 
 			continue;
 		}
 
-		if (token === "--theme") {
-			const next = tokens[i + 1];
-			if (!next || next.startsWith("-")) {
+		const themeEquals = token.match(/^--theme=(.*)$/);
+		if (themeEquals || token === "--theme") {
+			const rawTheme = themeEquals ? themeEquals[1] : tokens[i + 1];
+			if (!rawTheme || rawTheme.startsWith("-")) {
 				return { error: "Missing theme after --theme. Use light, dark, or auto." };
 			}
-			const normalizedTheme = next.toLowerCase();
+			const normalizedTheme = rawTheme.toLowerCase();
 			if (!BROWSER_THEME_PREFERENCES.includes(normalizedTheme as BrowserThemePreference)) {
-				return { error: `Invalid theme "${next}". Use light, dark, or auto.` };
+				return { error: `Invalid theme "${rawTheme}". Use light, dark, or auto.` };
 			}
 			theme = normalizedTheme as BrowserThemePreference;
-			i++;
+			if (!themeEquals) i++;
+			continue;
+		}
+
+		const outputEquals = token.match(/^--(out|out-dir)=(.*)$/);
+		if (outputEquals) {
+			const outputOption = `--${outputEquals[1]}`;
+			if (!options.allowPdfOutputOptions) {
+				return { error: `${outputOption} is only supported by /preview-pdf-save.` };
+			}
+			if (!outputEquals[2]) {
+				return { error: outputOption === "--out" ? "Missing path after --out." : "Missing directory after --out-dir." };
+			}
+			if (outputOption === "--out") out = outputEquals[2];
+			else outDir = outputEquals[2];
 			continue;
 		}
 
@@ -4107,7 +4585,7 @@ function parsePreviewArgs(args: string, options: ParsePreviewArgsOptions = {}): 
 				return { error: `${token} is only supported by /preview-pdf-save.` };
 			}
 			const next = tokens[i + 1];
-			if (!next || next.startsWith("-")) {
+			if (next === undefined) {
 				return { error: token === "--out" ? "Missing path after --out." : "Missing directory after --out-dir." };
 			}
 			if (token === "--out") out = next;
@@ -4267,14 +4745,19 @@ export default function (pi: ExtensionAPI) {
 		],
 		parameters: previewExportSchema,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			if (signal?.aborted) {
-				return { content: [{ type: "text", text: "Preview export cancelled." }], details: undefined };
-			}
+			const cancellationResult = () => ({
+				content: [{ type: "text" as const, text: "Preview export cancelled." }],
+				details: undefined,
+			});
+			if (signal?.aborted) return cancellationResult();
 
-			const input = await resolvePreviewInput(ctx, params);
-			const outputPath = params.outputPath?.trim() ? resolveUserPath(ctx, params.outputPath) : undefined;
-			const warnings: string[] = [];
+			try {
+			const input = await resolvePreviewInput(ctx, params, signal);
 			const format = params.format;
+			const outputPath = params.outputPath?.trim()
+				? normalizeArtifactOutputPath(resolveUserPath(ctx, params.outputPath), format)
+				: undefined;
+			const warnings: string[] = [];
 			const defaultArtifactTheme: BrowserThemePreference = format === "html" ? "light" : "auto";
 			const style = applyBrowserThemeOverride(getPreviewStyle(ctx.ui.theme), params.theme ?? defaultArtifactTheme);
 			const openedPaths: string[] = [];
@@ -4291,10 +4774,10 @@ export default function (pi: ExtensionAPI) {
 				const pdfPath = await renderPreviewPdfToFile(input.markdown, outputPath, input.resourcePath, input.isLatex, (message) => {
 					warnings.push(message);
 					onUpdate?.({ content: [{ type: "text", text: message }], details: undefined });
-				});
+				}, signal);
 				paths = [pdfPath];
 			} else if (format === "html") {
-				const htmlPath = await renderPreviewHtmlToFile(input.markdown, style, input.resourcePath, input.isLatex, params.fontSizePx, outputPath, "inline-svg");
+				const htmlPath = await renderPreviewHtmlToFile(input.markdown, style, input.resourcePath, input.isLatex, params.fontSizePx, outputPath, "inline-svg", signal);
 				paths = [htmlPath];
 			} else {
 				const pngResult = await renderPreviewPngFiles(input.markdown, style, outputPath, input.resourcePath, input.isLatex, params.fontSizePx, signal);
@@ -4306,8 +4789,14 @@ export default function (pi: ExtensionAPI) {
 			if (params.open && paths.length > 0) {
 				const toOpen = format === "png" ? [paths[0]!] : paths;
 				for (const filePath of toOpen) {
-					await openFileInDefaultBrowser(filePath);
-					openedPaths.push(filePath);
+					try {
+						await openFileInDefaultBrowser(filePath, signal);
+						openedPaths.push(filePath);
+					} catch (error) {
+						if (!isPreviewExportCancellation(error, signal)) throw error;
+						warnings.push("Artifact rendering completed, but opening was cancelled.");
+						break;
+					}
 				}
 			}
 
@@ -4341,6 +4830,10 @@ export default function (pi: ExtensionAPI) {
 				content: [{ type: "text", text: lines.join("\n") }],
 				details,
 			};
+			} catch (error) {
+				if (isPreviewExportCancellation(error, signal)) return cancellationResult();
+				throw error;
+			}
 		},
 	});
 
@@ -4406,9 +4899,9 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const outputPath = getDefaultBrowserPdfOutputPath(ctx, sourceFilePath, parsed.out, parsed.outDir);
-			const style = applyBrowserThemeOverride(getPreviewStyle(ctx.ui.theme), parsed.theme);
 			try {
+				const outputPath = getDefaultBrowserPdfOutputPath(ctx, sourceFilePath, parsed.out, parsed.outDir);
+				const style = applyBrowserThemeOverride(getPreviewStyle(ctx.ui.theme), parsed.theme);
 				ctx.ui.notify("Generating PDF via browser...", "info");
 				await renderBrowserPdfToFile(input.markdown, style, outputPath, input.resourcePath, input.isLatex, parsed.fontSizePx);
 				ctx.ui.notify(`Saved PDF: ${outputPath}`, "info");

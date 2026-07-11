@@ -60,7 +60,7 @@ Preview adapts to your pi theme. Examples with a custom theme and the built-in d
 pi install git:github.com/SleeperXZY/pi-markdown-preview
 ```
 
-Pi installs the runtime dependencies (`puppeteer-core` and `mathjax`) automatically. The checkout is stored at:
+Pi installs the runtime dependencies (`puppeteer-core`, `mathjax`, and the Windows-safe command launcher `cross-spawn`) automatically. The checkout is stored at:
 
 ```text
 ~/.pi/agent/git/github.com/SleeperXZY/pi-markdown-preview/
@@ -104,7 +104,7 @@ Supported formats:
 - `html` — writes a rendered HTML document with the local MathJax SVG bundle embedded; Mermaid diagrams still require network access when the document is opened
 - `png` — writes one PNG per rendered preview page, appending `-1-of-N`, `-2-of-N`, etc. for multi-page output
 
-The tool accepts optional `outputPath`, `fontSizePx`, `resourcePath`, `theme`, and `open` arguments. HTML artifacts default to light, while PNG artifacts default to `auto` and follow pi's current theme. `theme` accepts `light`, `dark`, or `auto` and does not affect LaTeX PDF output. By default the tool only writes files and returns paths, so another integration (for example Telegram or an upload/send-file tool) can deliver them.
+The tool accepts optional `outputPath`, `fontSizePx`, `resourcePath`, `theme`, and `open` arguments. HTML artifacts default to light, while PNG artifacts default to `auto` and follow pi's current theme. `theme` accepts `light`, `dark`, or `auto` and does not affect LaTeX PDF output. Missing `.pdf`, `.html`, or `.png` extensions are appended to `outputPath`; mismatched extensions are rejected. Cancellation terminates active Pandoc, LaTeX, Mermaid, and Chromium work, removes staged files, and preserves an existing destination. By default the tool only writes files and returns paths, so another integration (for example Telegram or an upload/send-file tool) can deliver them.
 
 Example user requests pi can satisfy with `preview_export`:
 
@@ -132,26 +132,27 @@ import {
 
 Additional accepted argument aliases:
 - Pick: `-p`, `pick`
-- File: `-f`
+- File: `-f`, `--file=<path>`, `-f=<path>`
 - Browser target: `browser`, `--external`, `external`, `--browser-native`, `native`
 - PDF target: `pdf`
 - Terminal target: `terminal`, `--terminal` (usually unnecessary because terminal is the default)
 - Font size: `--font-size <px>`, `--font-size=<px>`, `--font-size-px <px>`, `--fs <px>` (10–24 px; terminal/browser previews; defaults: terminal 16, browser 15)
-- Theme: `--theme light|dark|auto` (browser preview and `/preview-pdf-save`; defaults to light; `auto` follows pi theme inference)
-- Output path: `--out <path>` (`/preview-pdf-save` only)
-- Output directory: `--out-dir <dir>` (`/preview-pdf-save` only; default: `./.pi-markdown-preview`)
+- Theme: `--theme light|dark|auto`, `--theme=<value>` (browser preview and `/preview-pdf-save`; defaults to light; `auto` follows pi theme inference)
+- Output path: `--out <path>`, `--out=<path>` (`/preview-pdf-save` only; appends `.pdf` when omitted and rejects other extensions)
+- Output directory: `--out-dir <dir>`, `--out-dir=<dir>` (`/preview-pdf-save` only; default: `./.pi-markdown-preview`)
 - Help: `--help`, `-h`, `help`
-- Note: `--pick` and `--file` cannot be used together; `--out` and `--out-dir` cannot be combined
+- Option terminator: `--` treats the following token as a file path, including paths beginning with `-`
+- Note: quoted arguments and escaped spaces are supported; `--pick` and `--file` cannot be used together; `--out` and `--out-dir` cannot be combined
 
 LaTeX PDF export uses Pandoc plus a LaTeX PDF engine (`xelatex` by default). The PDF preamble uses optional styling packages when available, including `ctex` and CJK font selection, light code-block backgrounds via `framed`, and simpler fallbacks otherwise. Long-running PDF subprocesses time out after 120 seconds by default; set `PI_MARKDOWN_PREVIEW_PDF_TIMEOUT_MS` to adjust this.
 
-Run the static, registration, and type checks with:
+Run the static, registration, cancellation, and type checks with:
 
 ```bash
 npm run check
 ```
 
-Run real HTML, PNG, LaTeX PDF, and Chromium PDF rendering checks with:
+Run real HTML, PNG, every LaTeX PDF path, and Chromium PDF rendering checks with:
 
 ```bash
 npm run test:smoke
